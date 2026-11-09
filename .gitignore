@@ -1,0 +1,5 @@
+/target
+/.dup-detector
+/samples
+*.pdf
+!tests/fixtures/*.pdf

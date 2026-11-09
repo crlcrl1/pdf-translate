@@ -1,0 +1,43 @@
+[package]
+name = "pdf-translate"
+version = "0.1.0"
+edition = "2024"
+description = "Layout-preserving PDF paper translator"
+license = "MIT"
+
+[features]
+default = ["embedded-fonts"]
+# Embed the compressed Noto Serif CJK SC regular font in assets/fonts.
+# Enable embedded-bold-font to also embed the bold face; otherwise bold text
+# uses the synthetic bold renderer.
+embedded-fonts = []
+embedded-bold-font = ["embedded-fonts"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+fontdb = "0.24"
+ruzstd = "0.9"
+hayro = { version = "0.9", features = ["embed-fonts", "embed-cmaps"] }
+hex = "0.4"
+lopdf = "0.47"
+rayon = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "system-proxy", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+subsetter = "0.2"
+same-file = "1"
+tempfile = "3"
+smallvec = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ttf-parser = "0.25"
+unicode-blocks = "0.1"
+unicode-math-class = "0.1"
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
