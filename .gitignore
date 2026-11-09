@@ -3,3 +3,4 @@
 /samples
 *.pdf
 !tests/fixtures/*.pdf
+.idea
