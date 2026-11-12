@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+mod fonts;
+
+use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
 use hayro::hayro_interpret::font::{Glyph, GlyphRun};
@@ -14,7 +16,6 @@ use rayon::prelude::*;
 
 use crate::model::{BBox, ExtractedPage, GlyphBox, ImageBox, SourceGlyph};
 use crate::pages::PageSelection;
-use crate::pdf::content::{TextFontRun, page_original_content, text_font_runs};
 
 const MAX_GLYPHS_PER_PAGE: usize = 1_000_000;
 /// Below this many pages, thread setup and duplicated per-thread font caches
@@ -22,12 +23,12 @@ const MAX_GLYPHS_PER_PAGE: usize = 1_000_000;
 const PARALLEL_PAGE_THRESHOLD: usize = 8;
 
 pub fn extract_pdf(
-    data: Vec<u8>,
+    _data: Vec<u8>,
     lopdf_document: &lopdf::Document,
     selection: &PageSelection,
 ) -> Result<Vec<ExtractedPage>> {
-    let pdf = Pdf::new(data).map_err(|err| anyhow!("failed to parse PDF: {err:?}"))?;
-    let lopdf_pages = lopdf_document.get_pages();
+    let pdf = Pdf::new(fonts::tagged_pdf(lopdf_document, selection)?)
+        .map_err(|err| anyhow!("failed to parse PDF: {err:?}"))?;
 
     let settings = InterpreterSettings {
         render_content: RenderContent::PAGE,
@@ -44,31 +45,19 @@ pub fn extract_pdf(
         selected
             .par_iter()
             .map_init(InterpreterCache::new, |cache, (index, page)| {
-                extract_page(lopdf_document, &lopdf_pages, cache, &settings, *index, page)
+                extract_page(cache, &settings, *index, page)
             })
             .collect()
     } else {
         let cache = InterpreterCache::new();
         selected
             .iter()
-            .map(|(index, page)| {
-                extract_page(
-                    lopdf_document,
-                    &lopdf_pages,
-                    &cache,
-                    &settings,
-                    *index,
-                    page,
-                )
-            })
+            .map(|(index, page)| extract_page(&cache, &settings, *index, page))
             .collect()
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn extract_page<'a>(
-    document: &lopdf::Document,
-    lopdf_pages: &BTreeMap<u32, lopdf::ObjectId>,
     cache: &InterpreterCache<'a>,
     settings: &InterpreterSettings,
     index: usize,
@@ -98,18 +87,8 @@ fn extract_page<'a>(
     }
 
     let glyph_signature = collector.sequence.signature();
+    collector.attach_rules();
     let mut glyphs = collector.glyphs;
-    if glyphs.iter().any(|glyph| glyph.font_name.is_none())
-        && let Some(page_id) = lopdf_pages.get(&(index as u32 + 1))
-        && let Ok(mut runs) = page_font_runs(document, *page_id)
-    {
-        for run in &mut runs {
-            let point = transform * Point::new(run.x, run.y);
-            run.x = point.x;
-            run.y = point.y;
-        }
-        assign_font_names(&mut glyphs, &runs);
-    }
     assign_font_styles(&mut glyphs);
 
     Ok(ExtractedPage {
@@ -123,37 +102,8 @@ fn extract_page<'a>(
         glyph_signature,
         glyphs,
         images: collector.images,
+        rules: collector.rules.into_iter().map(|(bbox, _)| bbox).collect(),
     })
-}
-
-fn page_font_runs(
-    document: &lopdf::Document,
-    page_id: lopdf::ObjectId,
-) -> Result<Vec<TextFontRun>> {
-    let (content, resources) = page_original_content(document, page_id)?;
-    let mut fonts = HashMap::new();
-    if let Some(font_dict) = resources.get(b"Font").ok().and_then(|object| match object {
-        lopdf::Object::Reference(id) => document.get_dictionary(*id).ok(),
-        value => value.as_dict().ok(),
-    }) {
-        for (name, value) in font_dict.iter() {
-            let font = match value {
-                lopdf::Object::Reference(id) => document.get_dictionary(*id).ok(),
-                value => value.as_dict().ok(),
-            };
-            if let Some(font) = font
-                && let Ok(base_font) = font.get(b"BaseFont")
-                && let Ok(base_font) = base_font.as_name()
-            {
-                fonts.insert(
-                    name.clone(),
-                    String::from_utf8_lossy(base_font).into_owned(),
-                );
-            }
-        }
-    }
-
-    text_font_runs(&content, &fonts)
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +140,7 @@ fn font_style(name: &str) -> FontStyle {
     let mono = lower.contains("mono")
         || lower.contains("courier")
         || lower.contains("cmtt")
+        || lower.contains("sftt")
         || lower.contains("monl");
     FontStyle {
         bold,
@@ -220,27 +171,6 @@ fn assign_font_styles(glyphs: &mut [GlyphBox]) {
     }
 }
 
-fn assign_font_names(glyphs: &mut [GlyphBox], runs: &[TextFontRun]) {
-    for glyph in glyphs {
-        if glyph.font_name.is_some() {
-            continue;
-        }
-        let tolerance = 0.6;
-        let mut best: Option<&TextFontRun> = None;
-        for run in runs {
-            if (run.y - glyph.origin_y).abs() > tolerance || run.x > glyph.origin_x + 0.6 {
-                continue;
-            }
-            if best.is_none_or(|current| run.x > current.x) {
-                best = Some(run);
-            }
-        }
-        if let Some(run) = best {
-            glyph.font_name = Some(run.font.clone());
-        }
-    }
-}
-
 fn rotation_degrees(rotation: Rotation) -> i32 {
     match rotation {
         Rotation::None => 0,
@@ -264,12 +194,14 @@ struct Collector {
     /// charstrings). Pages repeat the same glyphs many times, so cache the
     /// bounding box per font/glyph pair.
     glyph_bounds: HashMap<u128, Option<Rect>>,
+    rules: Vec<(BBox, f64)>,
 }
 
 struct MarkedContent {
     actual_text: Option<String>,
     start: usize,
     artifact: bool,
+    font_name: Option<String>,
 }
 
 impl Collector {
@@ -296,6 +228,38 @@ impl Collector {
             protected |= *opacity < 1.0 || *complex;
         }
         Some(protected || self.marked.iter().any(|mark| mark.artifact))
+    }
+
+    fn attach_rules(&mut self) {
+        for (rule, thickness) in &self.rules {
+            let y = (rule.y0 + rule.y1) * 0.5;
+            // TeX emits underlines before the letters they underline. Looking
+            // only backwards mistakes the preceding '(' or '-' for an unsafe
+            // underscore and disables an entire abstract or body paragraph.
+            if let Some(glyph) = self.glyphs.iter_mut().find(|glyph| {
+                rule.width() <= glyph.font_size * 1.2
+                    && thickness <= &(glyph.font_size * 0.12)
+                    && (glyph.origin_y - y).abs() <= glyph.font_size * 0.25
+                    && rule.horizontal_overlap(glyph.bbox) > 0.7
+                    && glyph.bbox.y0 >= y - glyph.font_size * 0.15
+            }) {
+                glyph.decorations.push(*rule);
+                continue;
+            }
+            if let Some(glyph) = self.glyphs.iter_mut().rev().find(|glyph| {
+                rule.width() >= glyph.font_size * 0.15
+                    && rule.width() <= glyph.font_size * 0.9
+                    && thickness <= &(glyph.font_size * 0.12)
+                    && (glyph.origin_y - y).abs() <= glyph.font_size * 0.25
+                    && glyph.bbox.x1 <= rule.x0 + glyph.font_size * 0.15
+                    && rule.x0 - glyph.bbox.x1 <= glyph.font_size * 0.6
+                    && glyph.text.chars().count() == 1
+                    && glyph.text.chars().all(|ch| ch.is_ascii_alphanumeric())
+            }) {
+                glyph.decorations.push(*rule);
+                glyph.text.push('_');
+            }
+        }
     }
 }
 
@@ -348,42 +312,14 @@ impl<'a> Device<'a> for Collector {
         }
         let x0 = start.x.min(end.x);
         let x1 = start.x.max(end.x);
-        let width = x1 - x0;
-        if self
-            .visibility(BBox::new(x0, start.y - 0.1, x1, start.y + 0.1))
-            .is_none()
-        {
+        let thickness = f64::from(stroke.line_width) * props.transform.determinant().abs().sqrt();
+        // A zero-width PDF stroke is still a visible device hairline.
+        let half_width = thickness.max(0.2) * 0.5;
+        let bbox = BBox::new(x0, start.y - half_width, x1, start.y + half_width);
+        if self.visibility(bbox).is_none() {
             return;
         }
-        // TeX can draw an underscore as a short vector rule between glyphs.
-        // Turn it into a real "_" in the extracted text and remember the rule
-        // box so the composer can cover the original stroke. This avoids
-        // leaving stray lines while still allowing the paragraph to translate.
-        if let Some(glyph) = self.glyphs.iter_mut().rev().find(|glyph| {
-            width >= glyph.font_size * 0.15
-                && width <= glyph.font_size * 0.9
-                && f64::from(stroke.line_width) <= glyph.font_size * 0.12
-                && (glyph.origin_y - start.y).abs() <= glyph.font_size * 0.25
-                && glyph.bbox.x1 <= x0 + glyph.font_size * 0.15
-                && x0 - glyph.bbox.x1 <= glyph.font_size * 0.6
-        }) {
-            let convertible = glyph.text.chars().count() == 1
-                && glyph
-                    .text
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_alphanumeric());
-            if convertible {
-                glyph
-                    .decorations
-                    .push(BBox::new(x0, start.y - 0.1, x1, start.y + 0.1));
-                if !glyph.text.ends_with('_') {
-                    glyph.text.push('_');
-                }
-            } else {
-                glyph.protected = true;
-            }
-        }
+        self.rules.push((bbox, thickness));
     }
 
     fn push_clip_path(&mut self, clip_path: &ClipPath) {
@@ -466,6 +402,13 @@ impl<'a> Device<'a> for Collector {
                 ),
             };
 
+            let font_name = self
+                .marked
+                .iter()
+                .rev()
+                .find_map(|mark| mark.font_name.clone())
+                .or(font_name);
+
             let advance_origin = transform * Point::ZERO;
             let advance_end = transform * Point::new(advance_units, 0.0);
             let advance = (advance_end - advance_origin).length();
@@ -521,6 +464,7 @@ impl<'a> Device<'a> for Collector {
                 color,
                 invisible,
                 protected,
+                math_group: false,
                 decorations: Vec::new(),
                 char_code: glyph.char_code(),
                 glyph_id,
@@ -567,6 +511,13 @@ impl<'a> Device<'a> for Collector {
             actual_text,
             start: self.glyphs.len(),
             artifact: tag == b"Artifact",
+            font_name: (tag == fonts::FONT_TAG)
+                .then(|| {
+                    properties?
+                        .get::<hayro::hayro_interpret::hayro_syntax::object::String<'_>>(b"Name")
+                        .map(|name| String::from_utf8_lossy(name.as_bytes()).into_owned())
+                })
+                .flatten(),
         });
     }
 

@@ -11,7 +11,7 @@
 `pdf-translate` 把数字版学术论文的正文替换为目标语言，同时让图片、表格线、公式、页眉页脚和页面几何保持原位。它提取字形、字体、颜色、图片和坐标，重建行、段落与分栏，逐段调用任意
 OpenAI 兼容接口翻译，再用内置的 Noto Serif CJK SC 子集重新排版。
 
-当前版本提供 CLI（`inspect` 与 `translate`）；GUI、本地 HTTP 服务、Zotero 插件和双语对照页在规划中。
+当前版本提供 CLI（`inspect` 与 `translate`），以及一个调用该 CLI 的 Zotero 7+ 插件；CLI 可输出纯译文 PDF，也可输出左右并排的双语 PDF。GUI 和本地 HTTP 服务仍在规划中。
 
 ![原始页面（左）与中文译文页面（右）](docs/images/compare-page1.png)
 
@@ -24,7 +24,7 @@ OpenAI 兼容接口翻译，再用内置的 Noto Serif CJK SC 子集重新排版
 - **段落级翻译** — 支持任意 OpenAI 兼容的 chat 接口（OpenAI、DeepSeek、GLM、Qwen、Ollama、vLLM 等）；段落并发翻译，截断自动重试，结果跨进程磁盘缓存。
 - **中文排版** — 将 Noto Serif CJK SC 子集嵌入输出，写入 ToUnicode，支持中文断行、标点禁则、两端对齐和逐段字号拟合。
 - **单二进制** — 字体默认以 zstd 压缩后编译进可执行文件，不需要 Python 环境、外部转换器或系统字体。
-- **防御性默认值** — 预检会限制输入大小、解压流大小和图片尺寸；检测到数字签名时拒绝改写，避免静默破坏签名。
+- **防御性默认值** — 预检会限制输入大小和非图片流的解压大小；检测到数字签名时拒绝改写，避免静默破坏签名。
 
 ## 工作流程
 
@@ -165,6 +165,7 @@ pdf-translate translate <input.pdf> [-o output.pdf] [options]
 | `--pages 1-3,5`          | 只处理指定页面（1-based，默认 `1-`）    |
 | `--limit N`              | 只翻译前 N 段，便于调试                 |
 | `--overlay`              | 使用 overlay 合成；默认 clean           |
+| `--bilingual`            | 输出原文/译文左右并排的双语 PDF         |
 | `--no-cover`             | overlay 模式不画背景块                  |
 | `--keep-annotations`     | 保留译文页上的链接/标注                 |
 | `--translate-references` | 连参考文献也翻译（默认跳过）            |
@@ -195,6 +196,14 @@ pdf-translate translate <input.pdf> [-o output.pdf] [options]
 
 两种模式都不是针对元数据、附件、注释等所有 PDF 通道的通用脱敏工具。
 
+## 双语并排
+
+`--bilingual` 会输出新的 PDF：每页左侧是原文页，右侧是译文页，适合在 Zotero 或任意 PDF 阅读器中对照阅读。原文页上的注释不会复制到合并后的 PDF；支持 `/Rotate` 为 0/90/180/270 的页面及非零 CropBox 原点。Zotero 插件默认启用该模式，导入后直接以单个并排文档打开。
+
+```bash
+pdf-translate translate paper.pdf --bilingual -o paper.bilingual.pdf
+```
+
 ## 能力与限制
 
 已实现：
@@ -209,17 +218,18 @@ pdf-translate translate <input.pdf> [-o output.pdf] [options]
 - 粗体/斜体样式保留（启用或可用时使用真实 CJK 粗体，斜体为合成倾斜）；
 - CJK 字体子集嵌入、ToUnicode、中文断行、标点禁则和两端对齐基础；
 - 按字形执行 clean 合成，共享 Form XObject 按调用分别改写，混合文本保留原位置；
+- `--bilingual` 输出左右并排的双语 PDF，原文页和译文页都作为 Form XObject 组合；
 - overlay 合成：隔离原内容流的变换、裁剪和文字状态后绘制译文；
 - 按 `/ActualText` 提取替代文本；忽略完全裁剪、透明或不可见的文字，对局部裁剪、半透明、软蒙版等不能独立替换的文字保留原文；
 - 页面 `/Rotate` 为 0/90/180/270 时在旋转后的坐标系中分析和排版，支持非零 CropBox 原点；
 - 动态分配字体和公式资源名；保留同一字形对应不同 Unicode 字符的映射，并按 PDF 单位写入字体度量；
 - 字体缺字、译文达到最小字号仍然超宽/超高时警告并保留该段原文；所有段落均无法安全排版时不生成输出；
-- 预检会检查输入大小、流解压大小和图片尺寸（默认限制：输入 512 MiB、单流 64 MiB、累计流 256 MiB、单图 3200 万像素）。这些限制不构成对任意恶意
+- 预检会检查输入大小和非图片流的解压大小（默认限制：输入 512 MiB、单流 64 MiB、累计流 256 MiB）。图片流交给渲染器按需解码，不做预解压或尺寸限制。这些限制不构成对任意恶意
   PDF 的完整沙箱。
 
 尚未实现：
 
-- GUI、本地 HTTP 服务、Zotero 插件、双语对照页；
+- GUI、本地 HTTP 服务、段落级 Zotero 覆盖层；
 - OCR（扫描件目前只能用 overlay 模式保留原图，不做文字识别）；
 - 表格文字翻译（表格区域通常被保护）；
 - 链接矩形随译文移动；
@@ -268,7 +278,29 @@ src/
   translate/     OpenAI 兼容客户端、翻译缓存
   typeset.rs     断行、字号拟合、中文排版
   text.rs        CJK 字符判定等共享文本工具
+zotero/
+  manifest.json  Zotero 7+ 插件清单
+  bootstrap.js   插件启动/关闭
+  content/       阅读器按钮、菜单、子进程、设置页
+  locale/        Fluent 文案（en-US、zh-CN）
+  test/          纯函数的 Node 测试
 ```
+
+## Zotero 插件
+
+Zotero 集成是 CLI 外面的一层薄插件：在 PDF 阅读器工具栏加入「翻译」按钮，在条目右键菜单加入「翻译 PDF」，对选中的附件运行
+`pdf-translate`，用进度窗口展示各阶段，并导入一个单独的双语对照 PDF 子附件。再次点击时会优先打开已有的双语附件或缓存，
+而不是重新翻译。
+
+```bash
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/pdf-translate ~/.local/bin/
+./zotero/build.sh
+# 在「工具 -> 插件」中安装 zotero/dist/pdf-translate-zotero-<version>.xpi
+```
+
+设置、缓存位置和开发说明见 [`zotero/README.md`](zotero/README.md)。本地 HTTP/SSE 服务和段落级覆盖层仍待实现。
 
 ## 文档
 

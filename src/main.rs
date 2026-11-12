@@ -144,7 +144,7 @@ fn translate(args: TranslateArgs, config: &config::Config) -> Result<()> {
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| default_output(&args.input));
+        .unwrap_or_else(|| default_output(&args.input, args.bilingual));
     let (output, dump) = output::destinations(&args.input, &output, args.dump_layout.as_deref())?;
     let (input, mut document) = load_layout(
         &args.input,
@@ -279,8 +279,29 @@ fn translate(args: TranslateArgs, config: &config::Config) -> Result<()> {
         debug_boxes: args.debug_boxes,
         keep_annotations: args.keep_annotations,
     };
-    pdf::write_translated_pdf(input, &output, &document.pages, &typeset, &compose_options)?;
-    eprintln!("wrote {}", output.display());
+    if args.bilingual {
+        let parent = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let translated = tempfile::Builder::new()
+            .prefix(".pdf-translate-")
+            .suffix(".pdf")
+            .tempfile_in(parent)?
+            .into_temp_path();
+        pdf::write_translated_pdf(
+            input,
+            translated.as_ref(),
+            &document.pages,
+            &typeset,
+            &compose_options,
+        )?;
+        pdf::bilingual::write_bilingual_pdf(&args.input, translated.as_ref(), &output)?;
+        eprintln!("wrote bilingual {}", output.display());
+    } else {
+        pdf::write_translated_pdf(input, &output, &document.pages, &typeset, &compose_options)?;
+        eprintln!("wrote {}", output.display());
+    }
 
     Ok(())
 }
@@ -292,12 +313,13 @@ fn parse_selection(raw: &str) -> Result<PageSelection> {
     Ok(selection)
 }
 
-fn default_output(input: &Path) -> PathBuf {
+fn default_output(input: &Path, bilingual: bool) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".to_string());
-    input.with_file_name(format!("{stem}.zh.pdf"))
+    let suffix = if bilingual { "bilingual" } else { "zh" };
+    input.with_file_name(format!("{stem}.{suffix}.pdf"))
 }
 
 fn load_layout(

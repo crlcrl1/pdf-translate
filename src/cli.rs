@@ -49,7 +49,8 @@ pub struct TranslateArgs {
     /// Input PDF.
     pub input: PathBuf,
 
-    /// Output PDF. Defaults to <input stem>.zh.pdf.
+    /// Output PDF. Defaults to <input stem>.zh.pdf, or <input stem>.bilingual.pdf
+    /// with --bilingual.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
@@ -110,6 +111,11 @@ pub struct TranslateArgs {
     /// Explicitly retains covered source text; clean mode never selects it automatically.
     #[arg(long)]
     pub overlay: bool,
+
+    /// Write a side-by-side bilingual PDF: original page on the left,
+    /// translated page on the right.
+    #[arg(long)]
+    pub bilingual: bool,
 
     /// Keep link/annotation rectangles on translated pages.
     #[arg(long)]

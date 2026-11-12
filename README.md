@@ -14,8 +14,8 @@ tables, formulas, headers and footers where they were. It extracts glyphs, fonts
 reconstructs lines, paragraphs and columns, translates paragraph by paragraph through any OpenAI-compatible API, and
 typesets the result with an embedded CJK font.
 
-The current release is a CLI (`inspect` and `translate`). A GUI, local HTTP server, Zotero plugin and bilingual
-side-by-side pages are planned.
+The current release is a CLI (`inspect` and `translate`) plus a Zotero 7+ plugin that calls the CLI. The CLI can write
+a translated-only PDF or a side-by-side bilingual PDF; a GUI and local HTTP server are still planned.
 
 ![Original page (left) and translated page (right)](docs/images/compare-page1.png)
 
@@ -189,6 +189,7 @@ pdf-translate translate <input.pdf> [-o output.pdf] [options]
 | `--pages 1-3,5`          | Pages to process (1-based, default `1-`)              |
 | `--limit N`              | Translate at most N paragraphs (debugging)            |
 | `--overlay`              | Overlay mode; default is clean                        |
+| `--bilingual`            | Write a side-by-side bilingual PDF (original left, translation right) |
 | `--no-cover`             | Overlay mode: do not paint background patches         |
 | `--keep-annotations`     | Keep link/annotation rectangles on translated pages   |
 | `--translate-references` | Translate the reference list too (skipped by default) |
@@ -222,6 +223,17 @@ translation; forms, comments, redactions and other annotations are kept. Use `--
 
 Neither mode is a general redaction tool for metadata, attachments, annotations or every PDF channel.
 
+## Bilingual side-by-side
+
+`--bilingual` writes a new PDF whose pages contain the original page on the left and the translated page on the right. It
+is intended for comparison reading in Zotero or any PDF viewer; annotations on the original page are not copied into the
+combined PDF. Page rotations of 0/90/180/270 degrees and cropped page origins are supported. The Zotero plugin enables it by
+default, so the imported attachment opens as one side-by-side document.
+
+```bash
+pdf-translate translate paper.pdf --bilingual -o paper.bilingual.pdf
+```
+
 ## Capabilities and limitations
 
 Implemented:
@@ -239,6 +251,7 @@ Implemented:
 - CJK font subset embedding, ToUnicode, CJK line breaking, punctuation rules and basic justification;
 - clean composition by glyph, per-invocation rewriting of shared Form XObjects, and preservation of mixed text
   positions;
+- side-by-side bilingual output (`--bilingual`) with original and translated pages as Form XObjects;
 - overlay composition with isolated transforms, clipping and text state;
 - `/ActualText` extraction; fully clipped, transparent or invisible text ignored; partially clipped or soft-masked text
   kept as original;
@@ -246,12 +259,13 @@ Implemented:
 - dynamic font/formula resource names; distinct Unicode mappings for the same glyph; font metrics written in PDF units;
 - warnings and original-text fallback when a glyph is missing or the translation still overflows at the minimum size; no
   output when nothing can be typeset safely;
-- preflight limits on input size, decompressed streams and image dimensions (defaults: 512 MiB input, 64 MiB per stream,
-  256 MiB aggregate streams, 32 megapixels per image). These are not a complete sandbox for hostile PDFs.
+- preflight limits on input size and decompressed non-image streams (defaults: 512 MiB input, 64 MiB per stream,
+  256 MiB aggregate). Image streams are decoded by the renderer on demand and are neither pre-decompressed nor
+  size-capped. These are not a complete sandbox for hostile PDFs.
 
 Not implemented yet:
 
-- GUI, local HTTP server, Zotero plugin and bilingual side-by-side pages;
+- GUI, local HTTP server and paragraph-level Zotero overlays;
 - OCR for scanned PDFs (overlay mode can preserve the scan, but does not recognize text);
 - table text translation (table regions are protected);
 - moving link rectangles with the translated text;
@@ -301,7 +315,31 @@ src/
   translate/     OpenAI-compatible client and disk cache
   typeset.rs     line breaking, font fitting, CJK typesetting
   text.rs        shared CJK/text helpers
+zotero/
+  manifest.json  Zotero 7+ plugin manifest
+  bootstrap.js   plugin startup/shutdown
+  content/       reader button, menus, subprocess, settings
+  locale/        Fluent strings (en-US, zh-CN)
+  test/          Node tests for the pure helpers
 ```
+
+## Zotero plugin
+
+The Zotero integration is a thin plugin around the CLI. It adds a **Translate** button to the PDF reader and a
+**Translate PDF** item context menu entry, runs `pdf-translate` on the selected attachment, shows the CLI stages in a
+progress window, and imports a separate side-by-side bilingual PDF. Later clicks open the existing bilingual attachment
+or cache instead of translating again.
+
+```bash
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/pdf-translate ~/.local/bin/
+./zotero/build.sh
+# install zotero/dist/pdf-translate-zotero-<version>.xpi from Tools -> Plugins
+```
+
+See [`zotero/README.md`](zotero/README.md) for settings, cache locations and development notes. The local HTTP/SSE
+service and per-paragraph overlays are still future work.
 
 ## Documentation
 

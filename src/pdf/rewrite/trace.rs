@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use super::{Call, FormulaDrawing, RecordedGlyph, TRACE_TAG, write_path};
-use crate::model::{PageLayout, SourceGlyph};
+use crate::model::{BBox, PageLayout, SourceGlyph};
 use crate::pdf::glyphs::GlyphSequence;
 use crate::typeset::TypesetDocument;
 use anyhow::{Result, ensure};
@@ -13,7 +13,7 @@ use hayro::hayro_interpret::{
     InterpreterSettings, RenderContent,
 };
 use hayro::hayro_syntax::{object::Dict, page::Page};
-use hayro::kurbo::{Affine, BezPath, Point, Rect};
+use hayro::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 
 struct Target {
     source: SourceGlyph,
@@ -28,6 +28,7 @@ struct Trace<'a> {
     targets: HashMap<usize, Target>,
     drawings: Vec<FormulaDrawing>,
     error: Option<&'static str>,
+    rules: Vec<BBox>,
 }
 
 impl Trace<'_> {
@@ -37,6 +38,17 @@ impl Trace<'_> {
             remove: false,
             formula: None,
         })
+    }
+
+    fn remove_rule(&mut self) {
+        if let Some((id, false)) = self.active.iter().rev().flatten().next().copied()
+            && let Some(call) = self
+                .calls
+                .as_deref_mut()
+                .and_then(|calls| calls.get_mut(id))
+        {
+            call.remove_rule = true;
+        }
     }
 }
 
@@ -55,6 +67,7 @@ pub(super) fn trace_page<'a>(
         targets: HashMap::new(),
         drawings: Vec::new(),
         error: None,
+        rules: Vec::new(),
     };
     for paragraph in page
         .paragraphs
@@ -63,6 +76,7 @@ pub(super) fn trace_page<'a>(
     {
         if clean {
             for glyph in paragraph.lines(&page.lines).flat_map(|l| &l.glyphs) {
+                trace.rules.extend_from_slice(&glyph.decorations);
                 ensure!(
                     !glyph.sources.is_empty(),
                     "missing source glyph identity on page {}",
@@ -128,8 +142,118 @@ pub(super) fn trace_page<'a>(
 }
 
 impl<'a> Device<'a> for Trace<'_> {
-    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
-    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, mode: &DrawMode) {
+        let [PathEl::MoveTo(start), PathEl::LineTo(end)] = path.elements() else {
+            return;
+        };
+        let DrawMode::Stroke(stroke) = mode else {
+            return;
+        };
+        let start = props.transform * *start;
+        let end = props.transform * *end;
+        if (start.y - end.y).abs() > 0.05 {
+            return;
+        }
+        let thickness = f64::from(stroke.line_width) * props.transform.determinant().abs().sqrt();
+        // Fractions and overbars are PDF paths, not glyphs. Move the complete
+        // original rule with the formula instead of leaving it in the source
+        // position after all surrounding glyphs have been removed.
+        let formula = self.drawings.iter().position(|formula| {
+            let bbox = formula.bbox;
+            start.x.min(end.x) >= bbox.x0 - 1.0
+                && start.x.max(end.x) <= bbox.x1 + 1.0
+                && start.y >= bbox.y0
+                && start.y <= bbox.y1
+                && thickness <= 1.5
+        });
+        if let Some(index) = formula {
+            let color = match &props.paint {
+                hayro::hayro_interpret::Paint::Color(color) => color.to_rgba().to_rgba8(),
+                _ => [0, 0, 0, 255],
+            };
+            let out = &mut self.drawings[index].content;
+            let _ = writeln!(
+                out,
+                "q {} {} {} RG {thickness} w {} {} m {} {} l S Q",
+                f64::from(color[0]) / 255.,
+                f64::from(color[1]) / 255.,
+                f64::from(color[2]) / 255.,
+                start.x,
+                start.y,
+                end.x,
+                end.y
+            );
+        }
+        let matches = formula.is_some()
+            || self.rules.iter().any(|rule| {
+                (start.x.min(end.x) - rule.x0).abs() < 0.05
+                    && (start.x.max(end.x) - rule.x1).abs() < 0.05
+                    && (start.y - end.y).abs() < 0.05
+                    && (start.y - (rule.y0 + rule.y1) * 0.5).abs() < 0.05
+            });
+        if matches {
+            self.remove_rule();
+        }
+    }
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
+        let Image::Stencil(stencil) = image else {
+            return;
+        };
+        let bbox = BBox::from_kurbo(
+            props
+                .transform
+                .transform_rect_bbox(Rect::new(0.0, 0.0, 1.0, 1.0)),
+        );
+        if bbox.height() > 1.5
+            || bbox.width() < bbox.height() * 3.0
+            || props.soft_mask.is_some()
+            || props.blend_mode != hayro::hayro_interpret::BlendMode::Normal
+            || u64::from(stencil.width()) * u64::from(stencil.height()) > 4096
+        {
+            return;
+        }
+        let Some(index) = self.drawings.iter().position(|formula| {
+            bbox.x0 >= formula.bbox.x0 - 1.0
+                && bbox.x1 <= formula.bbox.x1 + 1.0
+                && bbox.y0 >= formula.bbox.y0
+                && bbox.y1 <= formula.bbox.y1
+        }) else {
+            return;
+        };
+        let mut solid_color = None;
+        stencil.with_stencil(
+            |mask, paint| {
+                if mask.data.iter().all(|alpha| *alpha == 255)
+                    && let hayro::hayro_interpret::Paint::Color(color) = paint
+                {
+                    let rgba = color.to_rgba().to_rgba8();
+                    if rgba[3] == 255 {
+                        solid_color = Some(rgba);
+                    }
+                }
+            },
+            None,
+        );
+        let Some(color) = solid_color else {
+            return;
+        };
+        // Some PDF producers encode fraction and radical bars as solid tiny
+        // stencil images. Preserve their exact rectangle in the formula Form.
+        let formula = &mut self.drawings[index];
+        formula.bbox = formula.bbox.union(bbox);
+        let _ = writeln!(
+            formula.content,
+            "q {} {} {} rg {} {} {} {} re f Q",
+            f64::from(color[0]) / 255.,
+            f64::from(color[1]) / 255.,
+            f64::from(color[2]) / 255.,
+            bbox.x0,
+            bbox.y0,
+            bbox.width(),
+            bbox.height()
+        );
+        self.remove_rule();
+    }
     fn push_clip_path(&mut self, _: &ClipPath) {}
     fn pop_clip(&mut self) {}
     fn push_transparency_group(

@@ -50,6 +50,7 @@ struct Call {
     glyphs: Vec<RecordedGlyph>,
     vertical: bool,
     recorded: bool,
+    remove_rule: bool,
 }
 
 struct RecordedGlyph {
@@ -167,12 +168,21 @@ fn apply_plan(
             continue;
         };
         let call = &calls[id];
-        let changed = call.glyphs.iter().any(|g| g.remove);
+        let changed = call.remove_rule || call.glyphs.iter().any(|g| g.remove);
         if changed {
             removed_scopes.extend(step.scopes.iter().copied());
             modified = true;
         }
-        rewritten.push(rewrite_text(step, call, changed)?);
+        rewritten.push(if call.remove_rule {
+            if step.operation.operator == "S" {
+                // End the path without painting; keep any clipping side effect.
+                vec![Operation::new("n", vec![])]
+            } else {
+                Vec::new()
+            }
+        } else {
+            rewrite_text(step, call, changed)?
+        });
     }
     let (operations, kept_properties) = clean_properties(doc, &plan, removed_scopes, rewritten);
     let content = Content { operations }.encode()?;

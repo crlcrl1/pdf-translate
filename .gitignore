@@ -1,6 +1,9 @@
 /target
 /.dup-detector
 /samples
+/output
+/tmp
 *.pdf
 !tests/fixtures/*.pdf
 .idea
+/zotero/dist

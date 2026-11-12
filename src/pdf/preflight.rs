@@ -10,7 +10,6 @@ use super::content::MAX_CONTENT_STREAM_BYTES;
 
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u64 = 32_000_000;
 
 pub struct ValidatedPdf {
     pub data: Vec<u8>,
@@ -45,37 +44,19 @@ pub fn load_pdf(path: &Path) -> Result<ValidatedPdf> {
                 b"DCTDecode" | b"JPXDecode" | b"JBIG2Decode" | b"CCITTFaxDecode"
             )
         });
-        if stream
+        let is_image = stream
             .dict
             .get(b"Subtype")
             .and_then(Object::as_name)
-            .is_ok_and(|s| s == b"Image")
-        {
-            let width = stream
-                .dict
-                .get(b"Width")
-                .and_then(Object::as_i64)
-                .unwrap_or(0);
-            let height = stream
-                .dict
-                .get(b"Height")
-                .and_then(Object::as_i64)
-                .unwrap_or(0);
-            if width <= 0
-                || height <= 0
-                || (width as u64).saturating_mul(height as u64) > MAX_IMAGE_PIXELS
-            {
-                bail!(
-                    "image {id:?} has unsupported dimensions ({width} x {height}); pixel limit is {MAX_IMAGE_PIXELS}"
-                );
-            }
-        } else if image_codec {
+            .is_ok_and(|s| s == b"Image");
+        if !is_image && image_codec {
             bail!("non-image stream {id:?} uses an image codec");
         }
-        // Image codecs are decoded by the renderer, with dimensions checked above.
-        // All other streams (including fonts, forms, patterns, masks, object and
-        // xref streams) must pass the bounded decoder before hayro sees the file.
-        let decoded_len = if image_codec {
+        // Image streams are decoded by the renderer; decompressing a
+        // Flate-compressed RGB image here would cost width * height * channels
+        // bytes and reject legitimate high-resolution figures. All other
+        // streams must pass the bounded decoder before hayro sees the file.
+        let decoded_len = if is_image || image_codec {
             stream.content.len()
         } else {
             stream

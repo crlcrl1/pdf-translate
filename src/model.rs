@@ -98,6 +98,9 @@ pub struct GlyphBox {
     /// Visible content that cannot safely be translated independently.
     #[serde(default)]
     pub protected: bool,
+    /// A geometric math group assembled before reading-line detection.
+    #[serde(default)]
+    pub math_group: bool,
     /// Short vector rules (for example TeX's `_` in `conv2_x`) that belong
     /// to this glyph. They are covered when the glyph is translated.
     #[serde(default)]
@@ -127,6 +130,10 @@ pub struct ExtractedPage {
     pub glyph_signature: [u8; 32],
     pub glyphs: Vec<GlyphBox>,
     pub images: Vec<ImageBox>,
+    /// Horizontal vector rules, kept separate from raster image obstacles.
+    /// Inline formula bounds must include these before fitting and clipping.
+    #[serde(default)]
+    pub rules: Vec<BBox>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,17 +242,29 @@ impl Paragraph {
 
     pub fn finalize_style(&mut self, lines: &[TextLine]) {
         let mut total = 0;
+        let mut bold = 0;
         let mut italic = 0;
-        for span in self.lines(lines).flat_map(|line| &line.spans) {
-            let count = span.text.chars().filter(|ch| !ch.is_whitespace()).count();
+        for span in self
+            .lines(lines)
+            .flat_map(|line| &line.spans)
+            .filter(|span| !span.formula)
+        {
+            let count = span.text.chars().filter(|ch| ch.is_alphanumeric()).count();
             total += count;
+            if span.bold {
+                bold += count;
+            }
             if span.italic {
                 italic += count;
             }
         }
         self.base_style = TextStyle {
-            bold: matches!(self.role, Role::Title | Role::Heading),
-            italic: total > 0 && italic * 10 >= total * 8,
+            // Semantic roles do not imply a font weight: many mathematical
+            // papers use regular-weight headings and small capitals.
+            // A majority style cannot override minority plain words. Mixed
+            // paragraphs need explicit tags for their actual emphasized runs.
+            bold: total > 0 && bold == total,
+            italic: total > 0 && italic == total,
         };
     }
 }

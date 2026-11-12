@@ -494,34 +494,6 @@ fn build_translation_ops(
     let mut out = String::from("q\n");
     write_matrix(&mut out, page_matrix(page).inverse());
 
-    // Clean mode removes text but leaves the short vector rules TeX uses for
-    // underscores. Cover only those tiny rules; the paragraph itself remains
-    // untouched otherwise.
-    if !cover {
-        let mut wrote = false;
-        for (paragraph, _) in translated {
-            for line in paragraph.lines(&page.lines) {
-                for glyph in &line.glyphs {
-                    for bbox in &glyph.decorations {
-                        if !wrote {
-                            out.push_str("q\n");
-                            let _ = writeln!(
-                                out,
-                                "{:.4} {:.4} {:.4} rg",
-                                options.cover_rgb[0], options.cover_rgb[1], options.cover_rgb[2]
-                            );
-                            wrote = true;
-                        }
-                        write_fill_rect(&mut out, bbox.inflate(0.3, 0.3));
-                    }
-                }
-            }
-        }
-        if wrote {
-            out.push_str("Q\n");
-        }
-    }
-
     if cover && options.cover_original {
         out.push_str("q\n");
         let _ = writeln!(
@@ -543,13 +515,14 @@ fn build_translation_ops(
                 write_text_run(&mut out, segment, line, font, bold_font, names);
             }
             for formula in &line.formulas {
-                let dx = formula.x - formula.source_bbox.x0;
-                let dy = formula.baseline - formula.source_baseline;
+                let scale = formula.scale;
+                let dx = formula.x - formula.source_bbox.x0 * scale;
+                let dy = formula.baseline - formula.source_baseline * scale;
                 let dest = BBox::new(
-                    formula.source_bbox.x0 + dx,
-                    formula.source_bbox.y0 + dy,
-                    formula.source_bbox.x1 + dx,
-                    formula.source_bbox.y1 + dy,
+                    formula.source_bbox.x0 * scale + dx,
+                    formula.source_bbox.y0 * scale + dy,
+                    formula.source_bbox.x1 * scale + dx,
+                    formula.source_bbox.y1 * scale + dy,
                 );
                 let _ = writeln!(out, "/Span << /ActualText ( ) >> BDC");
                 let _ = writeln!(out, "q");
@@ -561,7 +534,7 @@ fn build_translation_ops(
                     dest.width(),
                     dest.height()
                 );
-                let _ = writeln!(out, "1 0 0 1 {dx:.3} {dy:.3} cm");
+                let _ = writeln!(out, "{scale:.4} 0 0 {scale:.4} {dx:.3} {dy:.3} cm");
                 let name = names
                     .formulas
                     .get(&paragraph.id)

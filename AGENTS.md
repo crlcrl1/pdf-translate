@@ -9,6 +9,8 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
 - Iterate with debug builds. `[profile.release]` uses thin LTO, `codegen-units = 1`, `strip`, and embeds the compressed CJK fonts, so release builds are much slower.
 - Manual smoke test without a model: `cargo run -- translate <pdf> --fake --limit 5 -o /tmp/out.pdf`. Inspect layout JSON with `cargo run -- inspect <pdf> --pages 1`. `samples/` is gitignored/local-only.
 - The test suite is offline and needs no API key or network. Keep new tests offline (use `--fake`, fake clients, or pure functions).
+- Zotero plugin: `node --test zotero/test/*.test.mjs`; syntax-check the scripts with `node --check`; build the XPI with `./zotero/build.sh` (output is gitignored under `zotero/dist/`).
+- Keep the Zotero manifest version equal to the Rust package version in `Cargo.toml`. The plugin build rejects mismatches before packaging.
 
 ## Architecture
 
@@ -18,8 +20,10 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
   - `src/layout/`: line/paragraph/column heuristics.
   - `src/model.rs`: shared layout structures; `src/typeset.rs`: CJK wrapping and font fitting.
 - `src/pdf/regression.rs` is the main end-to-end safety net for `pdf/rewrite`, `pdf/writer`, `pdf/font`, and typeset changes. It renders outputs with hayro and asserts visible text, absent source bytes, clipping/rotation, etc. Run the full suite after touching those areas.
+- `src/pdf/bilingual.rs` composes the `--bilingual` output: each page embeds the original and translated page as Form XObjects side by side. It expects matching page counts/geometry and supports `/Rotate` 0/90/180/270 with cropped page origins.
 - Module convention: `src/foo.rs` declares `src/foo/bar.rs`; never add `mod.rs`.
 - `docs/DESIGN.md` proposes a lib + multiple bin targets and files that do not exist. Trust `src/` and the README "Module layout" section.
+- `zotero/` is a Zotero 7+ plugin (manifest v2, bootstrapped JS). It calls the built CLI through `Subprocess`, parses its merged stdout/stderr for progress, and imports a side-by-side bilingual PDF as a child attachment. It reopens an existing bilingual attachment or cache before translating again. The plugin is not part of the Cargo workspace.
 
 ## Tests and fixtures
 
@@ -27,7 +31,7 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
 - The fixture fonts are intentionally minimal: U+31350 is absent and U+2026/U+22EF share a glyph. Do not replace them with system fonts or regenerate casually.
 - `*.pdf` is gitignored except `tests/fixtures/*.pdf`; `/samples` is fully ignored. Do not make tests depend on `samples/` or local files; reuse the `Fixture` helper in `src/pdf/regression.rs` or build a PDF with `lopdf`.
 - CLI smoke tests inherit the developer's config (`PDF_TRANSLATE_CONFIG` or `~/.config/pdf-translate/config.toml`). If they fail while parsing config, unset that variable or move the file.
-- Translation cache: `translation_key()` in `src/translate.rs` uses versioned keys (v4 fake, v5 real) and stores them at `$XDG_CACHE_HOME/pdf-translate/translations.json`. Bump the version when changing prompts, markup validation, or cache semantics, or stale translations will be silently reused.
+- Translation cache: `translation_key()` in `src/translate.rs` uses v4 fake and v34 real keys, stored at `$XDG_CACHE_HOME/pdf-translate/translations.json`. Latin ligatures are expanded in model input and cache keys without changing original PDF glyphs. v29 preserves decimal list labels locally; v30 also rejects newly introduced kana and Hangul in Chinese prose. v31 retries language failures with concise prompts and sentence chunks. v32 uses a positive target-language instruction on the final retry. v34 preserves original list-symbol glyphs and migrates validated literal-bullet entries by rebinding marker IDs without retranslating prose. Compatible v28/v29/v30/v31/v32 replies, v27 marked text, v24 short fragments, v23 enumerations and v21 plain text migrate only after passing all current markup/language/list-label validators. Older v17/v19 plain-text entries may also migrate; pre-v27 marked text never migrates. Bump the affected version when changing prompts, markup validation, or cache semantics, or stale translations will be silently reused.
 
 ## Config and build quirks
 

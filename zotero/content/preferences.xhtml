@@ -1,0 +1,120 @@
+<!-- Plugin panes are parsed as XUL, so HTML elements need the html: prefix. -->
+<vbox id="pdf-translate-pane" class="pdf-translate-pane">
+  <html:style>
+    .pdf-translate-pane { max-width: 44em; }
+    .pdf-translate-pane .pt-section { margin-bottom: 1.6em; }
+    .pdf-translate-pane .pt-row {
+      display: grid; grid-template-columns: 12em minmax(0, 1fr); gap: .5em;
+      align-items: center; margin: .4em 0;
+    }
+    .pdf-translate-pane .pt-inline { display: flex; gap: .5em; align-items: center; }
+    .pdf-translate-pane .pt-inline input[type="text"] { flex: 1; min-width: 0; }
+    .pdf-translate-pane input[type="text"], .pdf-translate-pane select,
+    .pdf-translate-pane textarea { width: 100%; box-sizing: border-box; }
+    .pdf-translate-pane textarea { min-height: 4.5em; resize: vertical; }
+    .pdf-translate-pane .pt-actions { display: flex; gap: .5em; align-items: center; margin: .6em 0 0 12.5em; }
+    .pdf-translate-pane .pt-status { color: var(--fill-secondary, #666); white-space: pre-wrap; }
+    .pdf-translate-pane .pt-status.ok { color: var(--accent-green, #2e7d32); }
+    .pdf-translate-pane .pt-status.error { color: var(--accent-red, #ad3c36); }
+    .pdf-translate-pane h2 { margin: 0 0 .5em; font-size: 1.05em; }
+    .pdf-translate-pane .pt-hint { color: var(--fill-secondary, #666); font-size: .92em; }
+  </html:style>
+
+  <html:div class="pt-section">
+    <html:h2 data-l10n-id="pref-binary-heading"/>
+    <html:div class="pt-row">
+      <html:label for="pt-binary" data-l10n-id="pref-binary"/>
+      <html:div class="pt-inline">
+        <html:input id="pt-binary" type="text" data-l10n-id="pref-binary-input"
+          data-l10n-attrs="placeholder" preference="extensions.pdf-translate.binaryPath"/>
+        <html:button id="pt-detect" data-l10n-id="pref-detect"/>
+        <html:button id="pt-test" data-l10n-id="pref-test"/>
+      </html:div>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:span id="pt-status" class="pt-status"/>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:button id="pt-open-data" data-l10n-id="pref-open-data"/>
+    </html:div>
+  </html:div>
+
+  <html:div class="pt-section">
+    <html:h2 data-l10n-id="pref-translation-heading"/>
+    <html:div class="pt-row">
+      <html:label for="pt-target-lang" data-l10n-id="pref-target-lang"/>
+      <html:input id="pt-target-lang" type="text" preference="extensions.pdf-translate.targetLang"/>
+    </html:div>
+    <html:div class="pt-row">
+      <html:label for="pt-pages" data-l10n-id="pref-pages"/>
+      <html:input id="pt-pages" type="text" preference="extensions.pdf-translate.pages"/>
+    </html:div>
+    <html:div class="pt-row">
+      <html:label for="pt-mode" data-l10n-id="pref-mode"/>
+      <html:select id="pt-mode" preference="extensions.pdf-translate.mode">
+        <html:option value="clean" data-l10n-id="pref-mode-clean"/>
+        <html:option value="overlay" data-l10n-id="pref-mode-overlay"/>
+      </html:select>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.translateReferences"/>
+        <html:span data-l10n-id="pref-translate-references"/>
+      </html:label>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.keepAnnotations"/>
+        <html:span data-l10n-id="pref-keep-annotations"/>
+      </html:label>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.fake"/>
+        <html:span data-l10n-id="pref-fake"/>
+      </html:label>
+    </html:div>
+    <html:div class="pt-row">
+      <html:label for="pt-extra-args" data-l10n-id="pref-extra-args"/>
+      <html:div>
+        <html:textarea id="pt-extra-args" preference="extensions.pdf-translate.extraArgs"></html:textarea>
+        <html:div class="pt-hint" data-l10n-id="pref-extra-args-hint"/>
+      </html:div>
+    </html:div>
+    <html:div class="pt-row">
+      <html:label for="pt-config" data-l10n-id="pref-config"/>
+      <html:input id="pt-config" type="text" data-l10n-id="pref-config-input"
+        data-l10n-attrs="placeholder" preference="extensions.pdf-translate.configPath"/>
+    </html:div>
+  </html:div>
+
+  <html:div class="pt-section">
+    <html:h2 data-l10n-id="pref-output-heading"/>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.bilingual"/>
+        <html:span data-l10n-id="pref-bilingual"/>
+      </html:label>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.importAttachment"/>
+        <html:span data-l10n-id="pref-import"/>
+      </html:label>
+    </html:div>
+    <html:div class="pt-row">
+      <html:span/>
+      <html:label>
+        <html:input type="checkbox" preference="extensions.pdf-translate.openWhenDone"/>
+        <html:span data-l10n-id="pref-open-when-done"/>
+      </html:label>
+    </html:div>
+  </html:div>
+</vbox>

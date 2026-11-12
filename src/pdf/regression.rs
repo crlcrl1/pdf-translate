@@ -82,6 +82,18 @@ impl Fixture {
         self.doc.save(&self.input).unwrap();
     }
 
+    fn add_type1_font(&mut self, resource: &str, base: &str) {
+        let font = self.doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => Object::Name(base.as_bytes().to_vec()),
+        });
+        self.resources()
+            .get_mut(b"Font")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(resource, font);
+    }
+
     fn layout(&mut self) -> LayoutDocument {
         self.save();
         analyze_document(
@@ -386,6 +398,100 @@ fn actualtext_is_removed_from_changed_scopes_and_unused_properties() {
 }
 
 #[test]
+fn list_bullets_keep_the_same_original_shape_across_mixed_font_items() {
+    let mut fixture = Fixture::new(
+        "BT /F1 12 Tf 0 0 1 rg 72 700 Td (\\267) Tj ET
+         BT /Bold 12 Tf 0 g 90 700 Td (Short label. ) Tj /F1 12 Tf
+         (Ordinary prose dominates this first list item and continues) Tj ET
+         BT /F1 12 Tf 90 686 Td (on a second indented line.) Tj ET
+         BT /F1 12 Tf 0 0 1 rg 72 660 Td (\\267) Tj ET
+         BT /Bold 12 Tf 0 g 90 660 Td (A much longer emphasized label dominates this item. ) Tj
+         /F1 12 Tf (More prose) Tj ET
+         BT /F1 12 Tf 90 646 Td (wraps with a hanging indent.) Tj ET",
+    );
+    fixture.add_type1_font("Bold", "Helvetica-Bold");
+    let mut layout = fixture.layout();
+    let items: Vec<_> = layout.pages[0]
+        .paragraphs
+        .iter_mut()
+        .filter(|p| p.text.starts_with('•'))
+        .collect();
+    assert_eq!(items.len(), 2);
+    for (index, item) in items.into_iter().enumerate() {
+        assert!(!item.protected);
+        assert_eq!(item.formulas.len(), 1);
+        assert_eq!(item.formulas[0].text, "•");
+        let gap = if index == 0 { " " } else { "" };
+        item.translation = Some(format!("<f1>{gap}<b>译译</b>{}", "译".repeat(70)));
+    }
+    // The portable replacement font deliberately has no bullet glyph. Both
+    // bullets must still render from the original PDF, with their source color.
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.overflow, 0, "{stats:?}");
+    assert_eq!(set.paragraphs.len(), 2);
+    let original = render(&fixture.input);
+    let blue_bounds = |image: &hayro::vello_cpu::Pixmap, bbox: BBox| {
+        let pixels = image.data_as_u8_slice().as_chunks::<4>().0;
+        let width = image.width() as usize;
+        pixels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rgba)| {
+                let x = (i % width) as f64;
+                let y = 792.0 - (i / width) as f64;
+                (rgba[2] > 100
+                    && rgba[0] < 80
+                    && rgba[1] < 80
+                    && x >= bbox.x0 - 1.0
+                    && x <= bbox.x1 + 1.0
+                    && y >= bbox.y0 - 1.0
+                    && y <= bbox.y1 + 1.0)
+                    .then_some(BBox::new(x, y, x + 1.0, y + 1.0))
+            })
+            .reduce(BBox::union)
+            .expect("the original bullet disappeared")
+    };
+    for mode in [ComposeMode::Clean, ComposeMode::Overlay] {
+        let output = fixture.write_layout(&layout, &set, mode, &format!("bullets-{mode:?}.pdf"));
+        let pixels = render(&output);
+        for (id, item) in &set.paragraphs {
+            assert_eq!(item.scale, 1.0);
+            assert!(item.lines.len() >= 2);
+            let source_item = layout.pages[0]
+                .paragraphs
+                .iter()
+                .find(|p| p.id == *id)
+                .unwrap();
+            let body_x = source_item
+                .lines(&layout.pages[0].lines)
+                .next()
+                .unwrap()
+                .glyphs
+                .iter()
+                .find(|g| g.text == "S" || g.text == "A")
+                .unwrap()
+                .bbox
+                .x0;
+            for line in &item.lines {
+                assert!((line.segments[0].x - body_x).abs() < 0.001);
+            }
+            let bullet = &item.lines[0].formulas[0];
+            let source = bullet.source_bbox;
+            let placed = BBox::new(
+                bullet.x,
+                bullet.baseline + source.y0 - bullet.source_baseline,
+                bullet.x + source.width(),
+                bullet.baseline + source.y1 - bullet.source_baseline,
+            );
+            let before = blue_bounds(&original, source);
+            let after = blue_bounds(&pixels, placed);
+            assert!((before.width() - after.width()).abs() <= 1.0);
+            assert!((before.height() - after.height()).abs() <= 1.0);
+        }
+    }
+}
+
+#[test]
 fn inline_formula_is_an_isolated_vector_drawing() {
     let mut fixture = Fixture::new(
         "BT /F1 14 Tf 72 520 Td (Here is x as an inline formula for translation.) Tj ET",
@@ -450,6 +556,233 @@ fn inline_formula_is_an_isolated_vector_drawing() {
             .and_then(Object::as_name)
             .is_ok_and(|name| name == b"Form")
     })));
+}
+
+#[test]
+fn vector_and_stencil_rules_move_with_formulas_and_leave_no_source_rule() {
+    for representation in ["stroke", "inline", "xobject"] {
+        let mut fixture = Fixture::new(
+            "BT /F1 14 Tf 72 520 Td (Here is x as an inline formula for translation.) Tj ET",
+        );
+        fixture.save();
+        let source = extract_pages(&fixture.input, &PageSelection::all()).unwrap();
+        let glyph = source[0].glyphs.iter().find(|g| g.text == "x").unwrap();
+        let bbox = if representation == "stroke" {
+            glyph.bbox.inflate(0.0, 2.0)
+        } else {
+            glyph.bbox
+        };
+        let y = if representation == "stroke" {
+            glyph.bbox.y1 + 1.0
+        } else {
+            glyph.bbox.y1 - 0.5
+        };
+        let content = if representation == "stroke" {
+            format!("q 1 0 0 RG 1 w {} {y} m {} {y} l S Q", bbox.x0, bbox.x1).into_bytes()
+        } else {
+            let mut bytes =
+                format!("q 1 0 0 rg {} 0 0 1 {} {y} cm ", bbox.width(), bbox.x0).into_bytes();
+            if representation == "inline" {
+                bytes.extend_from_slice(b"BI /W 1 /H 1 /IM true /BPC 1 ID \0 EI ");
+            } else {
+                let image = fixture.doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+                        "ImageMask" => true, "BitsPerComponent" => 1,
+                    },
+                    vec![0],
+                ));
+                fixture
+                    .resources()
+                    .set("XObject", dictionary! {"Rule" => image});
+                bytes.extend_from_slice(b"/Rule Do ");
+            }
+            bytes.extend_from_slice(b"Q");
+            bytes
+        };
+        let rule = fixture.doc.add_object(Stream::new(dictionary! {}, content));
+        let original = fixture.doc.get_page_contents(fixture.page)[0];
+        fixture.doc.get_dictionary_mut(fixture.page).unwrap().set(
+            "Contents",
+            vec![Object::Reference(original), Object::Reference(rule)],
+        );
+        let mut layout = fixture.layout();
+        let images = layout.pages[0].images.clone();
+        let paragraph = layout.pages[0]
+            .paragraphs
+            .iter_mut()
+            .find(|p| !p.protected)
+            .unwrap();
+        paragraph.formulas = vec![crate::model::FormulaRef {
+            id: "f1".into(),
+            sources: glyph.sources.to_vec(),
+            text: "x".into(),
+            bbox,
+            baseline: glyph.origin_y,
+        }];
+        paragraph.translation = Some("译<f1>译".into());
+        crate::layout::include_formula_rules(paragraph, &images, &[]);
+        if representation != "stroke" {
+            assert!(paragraph.formulas[0].bbox.y1 > glyph.bbox.y1);
+        }
+        let (set, stats) = typeset(&layout, "ttf", 0.72);
+        assert_eq!(stats.overflow, 0);
+        let out = fixture.write_layout(&layout, &set, ComposeMode::Clean, "formula-rule.pdf");
+        let image = render(&out);
+        let red = |p: &[u8; 4]| p[0] > p[1].saturating_add(40) && p[1] < 200;
+        assert!(
+            image.data_as_u8_slice().as_chunks::<4>().0.iter().any(red),
+            "the {representation} formula rule disappeared"
+        );
+        let old = region(
+            &image,
+            bbox.x0.floor() as usize,
+            (792.0 - y - 2.0).floor() as usize,
+            bbox.width().ceil() as usize + 1,
+            5,
+        );
+        assert!(
+            !old.as_chunks::<4>().0.iter().any(red),
+            "the original {representation} rule was left behind"
+        );
+    }
+}
+
+#[test]
+fn stacked_inline_fractions_move_long_scripts_and_overhanging_rules_together() {
+    let mut fixture = Fixture::new(
+        "BT /F1 14 Tf 72 520 Td (The normalized reward is) Tj ET
+         BT /F2 14 Tf 245 520 Td (a) Tj /F1 14 Tf 8 0 Td (=) Tj ET
+         BT /F2 8 Tf 265 524 Td (a) Tj /F1 8 Tf 5 0 Td (-mean\\(population\\)) Tj ET
+         BT /F1 8 Tf 285 513 Td (std\\(sample\\)) Tj ET
+         BT /F1 14 Tf 342 520 Td (after centering the scores.) Tj ET
+         q 1 0 0 RG 0.6 w 263.5 521 m 336 521 l S Q",
+    );
+    fixture.add_type1_font("F2", "Symbol");
+    let mut layout = fixture.layout();
+    let paragraphs = &mut layout.pages[0].paragraphs;
+    assert_eq!(
+        paragraphs.len(),
+        1,
+        "detached numerator or denominator: {paragraphs:#?}"
+    );
+    let paragraph = &mut paragraphs[0];
+    assert!(!paragraph.protected);
+    let fraction = paragraph
+        .formulas
+        .iter()
+        .find(|f| f.sources.iter().any(|source| source.ordinal == 26))
+        .unwrap_or_else(|| panic!("fraction was split: {paragraph:#?}"));
+    for ordinal in 26..55 {
+        assert!(
+            fraction
+                .sources
+                .iter()
+                .any(|source| source.ordinal == ordinal),
+            "detached fraction glyph {ordinal}: {fraction:?}"
+        );
+    }
+    assert!(
+        fraction.bbox.x0 <= 263.5 && fraction.bbox.x1 >= 336.0,
+        "{fraction:?}"
+    );
+    let fraction_id = fraction.id.clone();
+    paragraph.translation = Some(
+        paragraph
+            .formulas
+            .iter()
+            .fold("译".to_owned(), |s, f| format!("{s}<{}>译", f.id)),
+    );
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.overflow, 0);
+    let placed = set
+        .paragraphs
+        .values()
+        .next()
+        .unwrap()
+        .lines
+        .iter()
+        .flat_map(|line| &line.formulas)
+        .find(|f| f.id == fraction_id)
+        .unwrap();
+    // The original 72.5 pt red fraction bar must remain complete after the
+    // formula has moved, including its overhang beyond the numerator ink.
+    for mode in [ComposeMode::Clean, ComposeMode::Overlay] {
+        let out = fixture.write_layout(&layout, &set, mode, &format!("fraction-{mode:?}.pdf"));
+        let image = render(&out);
+        let red = |p: &[u8; 4]| p[0] > p[1].saturating_add(30) && p[1] < 230;
+        let mut xs = Vec::new();
+        for (i, pixel) in image
+            .data_as_u8_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            if red(pixel) {
+                xs.push(i % 612);
+            }
+        }
+        assert!(!xs.is_empty(), "fraction bar disappeared in {mode:?}");
+        let width = xs.iter().max().unwrap() - xs.iter().min().unwrap() + 1;
+        assert!(
+            (width as f64 - 72.5 * placed.scale).abs() <= 2.0,
+            "clipped fraction bar: {width}"
+        );
+        assert!(
+            !region(&image, 262, 269, 76, 4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(red),
+            "source bar left behind in {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn numbered_serif_algorithm_preserves_body_and_translates_caption() {
+    let mut fixture = Fixture::new(
+        "BT /F1 11 Tf 72 650 Td (Algorithm 2 Sampling procedure) Tj ET
+         BT /F1 11 Tf 72 635 Td (Input: a collection of samples) Tj ET
+         BT /F1 11 Tf 72 620 Td (1: Initialize scores and counters) Tj ET
+         BT /F1 11 Tf 72 605 Td (2: Update the selected samples) Tj ET
+         BT /F1 11 Tf 72 590 Td (Output: the normalized scores) Tj ET
+         BT /F1 11 Tf 72 555 Td (The following paragraph explains the procedure in detail.) Tj ET",
+    );
+    let mut layout = fixture.layout();
+    let body: Vec<_> = layout.pages[0]
+        .paragraphs
+        .iter()
+        .filter(|p| p.bbox.y0 > 580.0 && p.bbox.y1 < 645.0)
+        .collect();
+    assert!(!body.is_empty());
+    assert!(body.iter().all(|p| p.protected), "{body:#?}");
+    let candidates: Vec<_> = layout.pages[0]
+        .paragraphs
+        .iter()
+        .filter(|p| !p.protected)
+        .collect();
+    assert_eq!(candidates.len(), 2, "{candidates:#?}");
+    assert!(
+        candidates
+            .iter()
+            .any(|p| p.text.starts_with("Algorithm 2") && !p.text.contains("Input"))
+    );
+    let original = render(&fixture.input);
+    for paragraph in &mut layout.pages[0].paragraphs {
+        if !paragraph.protected {
+            paragraph.translation = Some("译".into());
+        }
+    }
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.overflow, 0);
+    let out = fixture.write_layout(&layout, &set, ComposeMode::Clean, "algorithm.pdf");
+    assert_eq!(
+        region(&original, 70, 146, 400, 58),
+        region(&render(&out), 70, 146, 400, 58)
+    );
+    assert_absent_from_all_objects(&out, b"Sampling procedure");
 }
 
 #[test]
@@ -566,6 +899,152 @@ fn separate_vector_underscores_become_text_and_are_covered() {
             .flat_map(|line| &line.glyphs)
             .any(|glyph| !glyph.decorations.is_empty()),
         "vector underscore decoration was not recorded"
+    );
+}
+
+#[test]
+fn underline_before_its_letter_does_not_protect_prose_or_erase_the_background() {
+    let mut fixture = Fixture::new(
+        r"q 0.7 0.8 0.9 rg 60 480 500 70 re f Q
+         BT /F1 14 Tf 72 520 Td (An abstract about a method \() Tj ET",
+    );
+    fixture.save();
+    let extracted = extract_pages(&fixture.input, &PageSelection::all()).unwrap();
+    let last = extracted[0].glyphs.last().unwrap();
+    let x = last.origin_x + last.advance;
+    let extra = format!(
+        r"q 0.4 w {x} 518.5 m {} 518.5 l S Q BT /F1 14 Tf {x} 520 Td (Chain of thought\) continues here.) Tj ET",
+        x + 9.0,
+    );
+    let content = [
+        fixture.doc.get_page_content(fixture.page),
+        extra.into_bytes(),
+    ]
+    .concat();
+    let stream = fixture.doc.add_object(Stream::new(dictionary! {}, content));
+    fixture
+        .doc
+        .get_dictionary_mut(fixture.page)
+        .unwrap()
+        .set("Contents", stream);
+    let layout = fixture.layout();
+    assert!(layout.pages[0].paragraphs.iter().all(|p| !p.protected));
+    assert!(
+        layout.pages[0]
+            .paragraphs
+            .iter()
+            .any(|p| p.text.contains("(Chain"))
+    );
+    let output = fixture.compose(ComposeMode::Clean, "ttf", "Short.");
+    assert!(!visible_text(&output).contains("abstract"));
+    let image = render(&output);
+    // The original underline was on a colored panel. Clean rewriting must
+    // remove its paint operation instead of covering it with a white patch.
+    let pixels = region(&image, x as usize, 792 - 520, 9, 4);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|rgba| rgba[0] < 230 && rgba[2] > 190)
+    );
+}
+
+#[test]
+fn font_state_follows_show_operations_and_form_inheritance() {
+    let mut fixture = Fixture::new(
+        "BT /F1 12 Tf 1 0 0 1 72 500 Tm (A) Tj /Italic 12 Tf (B) Tj /F1 12 Tf (C) Tj ET
+         q BT /Italic 12 Tf 1 0 0 1 72 470 Tm (D) Tj ET Q
+         BT 1 0 0 1 72 440 Tm (E) Tj ET /Inherited Do",
+    );
+    let italic = fixture.doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Times-Italic",
+    });
+    fixture
+        .resources()
+        .get_mut(b"Font")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Italic", italic);
+    let form = fixture.doc.add_object(Stream::new(dictionary! {
+        "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    }, b"BT 1 0 0 1 72 410 Tm (F) Tj ET".to_vec()));
+    fixture
+        .resources()
+        .set("XObject", dictionary! {"Inherited" => form});
+    fixture.save();
+    let extracted = extract_pages(&fixture.input, &PageSelection::all()).unwrap();
+    let actual: Vec<_> = extracted[0]
+        .glyphs
+        .iter()
+        .map(|g| (g.text.as_str(), g.font_name.as_deref().unwrap()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("A", "Helvetica"),
+            ("B", "Times-Italic"),
+            ("C", "Helvetica"),
+            ("D", "Times-Italic"),
+            ("E", "Helvetica"),
+            ("F", "Helvetica")
+        ]
+    );
+}
+
+#[test]
+fn scaled_text_matrices_keep_math_font_names_and_scripts_local() {
+    let mut fixture = Fixture::new(
+        "BT /F1 1 Tf 10 0 0 10 72 520 Tm (This is ordinary prose before ) Tj
+         /Math 1 Tf 15 0 Td (R) Tj /F1 1 Tf 7 0 0 7 229 524 Tm (4) Tj
+         10 0 0 10 240 520 Tm ( and more ordinary prose after it.) Tj ET",
+    );
+    fixture.add_type1_font("Math", "Symbol");
+    let layout = fixture.layout();
+    let page = &layout.pages[0];
+    let paragraph = page
+        .paragraphs
+        .iter()
+        .find(|p| p.text.contains("ordinary prose"))
+        .unwrap();
+    assert!(!paragraph.protected);
+    let script = page
+        .lines
+        .iter()
+        .flat_map(|l| &l.glyphs)
+        .find(|g| g.text == "4")
+        .unwrap();
+    assert!(paragraph.formulas.iter().any(|f| {
+        f.sources
+            .iter()
+            .any(|s| s.ordinal == script.sources[0].ordinal)
+    }));
+    for glyph in page
+        .lines
+        .iter()
+        .flat_map(|l| &l.glyphs)
+        .filter(|g| g.origin_x < 200.0)
+    {
+        assert_eq!(glyph.font_name.as_deref(), Some("Helvetica"));
+    }
+}
+
+#[test]
+fn repeated_graphic_forms_do_not_exhaust_the_text_rewrite_budget() {
+    let mut fixture = Fixture::new(&format!("{BODY} {}", "/Dot Do ".repeat(10_001)));
+    let marker = fixture.doc.add_object(Stream::new(dictionary! {
+        "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(),0.into(),5.into(),5.into()],
+    }, b"0 0 4 4 re f".to_vec()));
+    fixture
+        .resources()
+        .set("XObject", dictionary! {"Dot" => marker});
+    let output = fixture.compose(ComposeMode::Clean, "ttf", "Short.");
+    assert!(visible_text(&output).contains("Short."));
+    assert!(!visible_text(&output).contains("regular paragraph"));
+    assert_eq!(
+        region(&render(&fixture.input), 0, 788, 4, 4),
+        region(&render(&output), 0, 788, 4, 4)
     );
 }
 
@@ -801,7 +1280,23 @@ fn exact_minimum_scale_is_attempted_even_between_steps() {
         .find(|p| !p.protected)
         .unwrap();
     paragraph.translation = Some("Translation.".to_string());
-    let target_height = paragraph.font_size * 1.22 * 0.73 + 0.0001;
+    let font = FontSource::load(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.ttf"),
+        None,
+    )
+    .unwrap();
+    let metrics = font.metrics("Translation.".chars()).unwrap();
+    let top_ink = metrics
+        .char_vertical_bounds
+        .values()
+        .map(|b| b.1)
+        .fold(0.0, f64::max);
+    let bottom_ink = metrics
+        .char_vertical_bounds
+        .values()
+        .map(|b| b.0)
+        .fold(0.0, f64::min);
+    let target_height = paragraph.font_size * (top_ink - bottom_ink) * 0.73 + 0.0001;
     let top = paragraph.bbox.y1;
     paragraph.bbox.y0 = top - 2.0;
     layout.pages[0].images.push(crate::model::ImageBox {
@@ -811,6 +1306,107 @@ fn exact_minimum_scale_is_attempted_even_between_steps() {
     assert_eq!(set.paragraphs.len(), 1);
     assert_eq!(stats.overflow, 0);
     assert!((stats.smallest_scale - 0.73).abs() < 0.00001);
+}
+
+#[test]
+fn inline_objects_shrink_with_text_and_render_at_the_fitted_position() {
+    let mut fixture = Fixture::new(
+        "BT /F1 14 Tf 72 520 Td (Here is ) Tj 0 0 1 rg (x) Tj 0 0 0 rg ( as an inline object in ordinary prose.) Tj ET",
+    );
+    let mut layout = fixture.layout();
+    let extracted = extract_pages(&fixture.input, &PageSelection::all()).unwrap();
+    let glyph = extracted[0].glyphs.iter().find(|g| g.text == "x").unwrap();
+    let paragraph = layout.pages[0]
+        .paragraphs
+        .iter_mut()
+        .find(|p| !p.protected)
+        .unwrap();
+    paragraph.formulas = vec![crate::model::FormulaRef {
+        id: "f1".into(),
+        text: "x".into(),
+        bbox: glyph.bbox,
+        baseline: glyph.origin_y,
+        sources: glyph.sources.to_vec(),
+    }];
+    paragraph.translation = Some("译<f1>译".into());
+    let font = FontSource::load(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.ttf"),
+        None,
+    )
+    .unwrap();
+    let metrics = font.metrics(['译']).unwrap();
+    let (bottom, top) = metrics.char_vertical_bounds[&'译'];
+    let ascent = (top * paragraph.font_size).max(glyph.bbox.y1 - glyph.origin_y);
+    let descent = (-bottom * paragraph.font_size).max(glyph.origin_y - glyph.bbox.y0);
+    let target_height = (ascent + descent) * 0.81;
+    let top = paragraph.bbox.y1;
+    paragraph.bbox.y0 = top - 1.0;
+    layout.pages[0].images.push(crate::model::ImageBox {
+        bbox: BBox::new(0.0, 0.0, 612.0, top - target_height - 2.0),
+    });
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.overflow, 0);
+    let placed = set.paragraphs.values().next().unwrap();
+    assert!(placed.scale <= 0.81 && placed.scale >= 0.72);
+    let object = &placed.lines[0].formulas[0];
+    assert_eq!(object.scale, placed.scale);
+    let output = fixture.write_layout(&layout, &set, ComposeMode::Clean, "scaled-formula.pdf");
+    assert_eq!(visible_text(&output), "译译");
+    let pixels = render(&output);
+    let mut blue = 0;
+    let width = pixels.width() as usize;
+    for (i, rgba) in pixels
+        .data_as_u8_slice()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        if rgba[2] > 100 && rgba[0] < 80 && rgba[1] < 80 {
+            blue += 1;
+            let x = (i % width) as f64;
+            let y = 792.0 - (i / width) as f64;
+            assert!(x >= object.x - 1.0 && x <= object.x + glyph.bbox.width() * object.scale + 1.0);
+            assert!(y >= object.baseline + (glyph.bbox.y0 - glyph.origin_y) * object.scale - 1.0);
+            assert!(y <= object.baseline + (glyph.bbox.y1 - glyph.origin_y) * object.scale + 1.0);
+        }
+    }
+    assert!(blue > 0, "the original vector object disappeared");
+}
+
+#[test]
+fn longer_headings_use_free_column_space_without_crossing_images() {
+    for obstacle in [false, true] {
+        let mut fixture = Fixture::new(
+            "BT /F1 14 Tf 72 650 Td (1. Example) Tj ET \
+             BT /F1 14 Tf 72 600 Td (This ordinary paragraph explains the example in detail.) Tj ET",
+        );
+        let mut layout = fixture.layout();
+        let heading = &mut layout.pages[0].paragraphs[0];
+        heading.role = crate::model::Role::Heading;
+        heading.protected = false;
+        heading.translation = Some("译".repeat(12));
+        let id = heading.id.clone();
+        if obstacle {
+            layout.pages[0].images.push(crate::model::ImageBox {
+                bbox: BBox::new(180.0, 640.0, 250.0, 670.0),
+            });
+        }
+        let (set, _) = typeset(&layout, "ttf", 0.72);
+        if !obstacle {
+            let heading = &set.paragraphs[&id];
+            assert_eq!(heading.lines.len(), 1);
+            assert_eq!(heading.scale, 1.0);
+        } else if let Some(heading) = set.paragraphs.get(&id) {
+            for line in &heading.lines {
+                for segment in &line.segments {
+                    let right =
+                        segment.x + set.font.metrics.text_width(&segment.text, line.size, 0.0);
+                    assert!(right <= 178.01);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -851,24 +1447,7 @@ fn oversized_compressed_stream_is_rejected_before_interpretation() {
 }
 
 #[test]
-fn oversized_images_and_signed_rewrites_are_rejected() {
-    let mut fixture = Fixture::new(BODY);
-    fixture.doc.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject", "Subtype" => "Image", "Width" => 1_000_000,
-            "Height" => 1_000_000, "Filter" => "DCTDecode",
-        },
-        vec![],
-    ));
-    fixture.save();
-    assert!(
-        super::preflight::load_pdf(&fixture.input)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("dimensions")
-    );
-
+fn signed_rewrites_are_rejected() {
     let mut fixture = Fixture::new(BODY);
     let mut layout = fixture.layout();
     layout.pages[0].paragraphs[0].translation = Some("Translation.".to_string());
@@ -901,7 +1480,7 @@ fn clean_preserves_a_rotated_glyph_inside_a_translated_line() {
 }
 
 #[test]
-fn caption_prompt_includes_merged_continuation_and_table_caption_stays_protected() {
+fn figure_and_table_captions_remain_translatable_with_their_continuations() {
     let mut fixture = Fixture::new(
         "BT /Bold 12 Tf 1 0 0 1 72 540 Tm (Figure 1. Baseline) Tj ET
          BT /F1 8 Tf 1 0 0 1 72 530 Tm (continued results) Tj ET
@@ -928,11 +1507,82 @@ fn caption_prompt_includes_merged_continuation_and_table_caption_stays_protected
             .contains("continued results")
     );
     assert!(
-        paras
+        !paras
             .iter()
             .find(|p| p.text.starts_with("Table"))
             .unwrap()
             .protected
+    );
+}
+
+#[test]
+fn code_listings_keep_their_pixels_and_inline_code_keeps_its_prose_translatable() {
+    let mut fixture = Fixture::new(
+        "BT /Code 10 Tf 0 0.4 0 rg 72 690 Td (theorem square :) Tj
+         12 -14 Td (have h := 1) Tj
+         0 -14 Td (-- preserve indentation and this comment) Tj ET
+         BT /F1 11 Tf 0 g 72 580 Td (This regular sentence uses ) Tj
+         /Code 11 Tf (identifier) Tj /F1 11 Tf ( in ordinary prose.) Tj ET",
+    );
+    fixture.add_type1_font("Code", "Courier");
+    let mut layout = fixture.layout();
+    let body = layout.pages[0]
+        .paragraphs
+        .iter_mut()
+        .find(|p| p.text.starts_with("This regular"))
+        .unwrap();
+    assert!(!body.protected);
+    assert_eq!(body.formulas.len(), 1);
+    body.translation = Some("译<f1>译".to_owned());
+    assert!(
+        layout.pages[0]
+            .paragraphs
+            .iter()
+            .filter(|p| p.bbox.y0 > 640.0)
+            .all(|p| p.protected)
+    );
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.overflow, 0);
+    for mode in [ComposeMode::Clean, ComposeMode::Overlay] {
+        let output = fixture.write_layout(&layout, &set, mode, &format!("code-{mode:?}.pdf"));
+        assert_eq!(
+            region(&render(&fixture.input), 60, 80, 490, 90),
+            region(&render(&output), 60, 80, 490, 90)
+        );
+    }
+}
+
+#[test]
+fn equation_heavy_pages_do_not_turn_regular_prose_into_bold_headings() {
+    let mut content = String::new();
+    for i in 0..16 {
+        content.push_str(&format!(
+            "BT /Math 8 Tf 72 {} Td (a=b+c+d+e+f+g+h) Tj ET\n",
+            540 - i * 12
+        ));
+    }
+    content.push_str("BT /F1 11 Tf 72 300 Td (reward model. Gradient Coefficient:) Tj ET
+                     BT /F1 11 Tf 72 260 Td (where the coefficient is computed from group scores.) Tj ET");
+    let mut fixture = Fixture::new(&content);
+    fixture.add_type1_font("Math", "Symbol");
+    let mut layout = fixture.layout();
+    for p in layout.pages[0]
+        .paragraphs
+        .iter_mut()
+        .filter(|p| p.text.starts_with("reward") || p.text.starts_with("where"))
+    {
+        assert_eq!(p.role, crate::model::Role::Paragraph);
+        assert!(!p.base_style.bold);
+        p.translation = Some("Translation.".to_owned());
+    }
+    let (set, stats) = typeset(&layout, "ttf", 0.72);
+    assert_eq!(stats.paragraphs, 2);
+    assert!(
+        set.paragraphs
+            .values()
+            .flat_map(|p| &p.lines)
+            .flat_map(|l| &l.segments)
+            .all(|s| !s.bold)
     );
 }
 

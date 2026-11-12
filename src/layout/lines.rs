@@ -1,10 +1,12 @@
 use super::{
     PageFrame,
-    inline::{is_math_char, is_math_glyph, is_math_operator, math_char_ratio},
+    inline::{
+        is_math_char, is_math_glyph, is_math_operator, is_named_math_operator, math_char_ratio,
+    },
     paragraphs::is_roman_numeral_digit,
 };
 use crate::model::{BBox, Column, GlyphBox, TextLine, TextSpan};
-use crate::text::collapse_whitespace;
+use crate::text::{collapse_whitespace, is_accent};
 use std::cmp::Ordering;
 
 pub(super) fn build_lines(glyphs: Vec<GlyphBox>) -> Vec<TextLine> {
@@ -83,7 +85,19 @@ pub(super) fn build_lines(glyphs: Vec<GlyphBox>) -> Vec<TextLine> {
         }
     }
 
-    let lines = merge_line_fragments(lines);
+    for line in &mut lines {
+        normalize_baseline(line);
+    }
+    let mut lines = merge_line_fragments(lines);
+    // Several fragments can bridge one visual line (e.g. a fraction between
+    // two prose runs). Repeat only while a merge makes progress.
+    loop {
+        let count = lines.len();
+        lines = merge_line_fragments(merge_script_fragments(lines));
+        if lines.len() == count {
+            break;
+        }
+    }
     let mut result: Vec<TextLine> = lines
         .into_iter()
         .filter_map(build_line)
@@ -100,14 +114,55 @@ pub(super) fn build_lines(glyphs: Vec<GlyphBox>) -> Vec<TextLine> {
     result
 }
 
+fn normalize_baseline(line: &mut LineAcc) {
+    let mut bases: Vec<_> = line
+        .glyphs
+        .iter()
+        .filter(|glyph| {
+            // Extension glyphs and accents have synthetic origins; only ordinary
+            // base glyphs can establish a reading line's typographic baseline.
+            !glyph
+                .font_name
+                .as_deref()
+                .is_some_and(|name| name.to_ascii_uppercase().contains("CMEX"))
+                && !glyph.text.chars().all(is_accent)
+        })
+        .collect();
+    let size = bases.iter().map(|g| g.font_size).fold(0.0, f64::max);
+    bases.retain(|g| g.font_size >= size * 0.95);
+    bases.sort_by(|a, b| a.origin_y.total_cmp(&b.origin_y));
+    if let Some(glyph) = bases.get(bases.len() / 2) {
+        line.baseline = glyph.origin_y;
+        line.font_size = size;
+    }
+}
+
 fn merge_line_fragments(fragments: Vec<LineAcc>) -> Vec<LineAcc> {
+    let math_boxes: Vec<_> = fragments
+        .iter()
+        .filter(|fragment| fragment.glyphs.iter().any(is_math_glyph))
+        .map(|fragment| fragment.bbox)
+        .collect();
     let mut merged: Vec<LineAcc> = Vec::new();
     for fragment in fragments {
         let candidate = merged.iter_mut().find(|line| {
             let max_size = line.font_size.max(fragment.font_size);
             (line.baseline - fragment.baseline).abs() < max_size * 0.15
                 && (line.angle - fragment.angle).abs() < 0.1
-                && horizontal_gap(line.bbox, fragment.bbox) < max_size * 2.0
+                && (horizontal_gap(line.bbox, fragment.bbox) < max_size * 2.0
+                    || (horizontal_gap(line.bbox, fragment.bbox) < max_size * 6.0
+                        && math_boxes.iter().any(|bbox| {
+                            let (left, right) = if line.bbox.x0 < fragment.bbox.x0 {
+                                (line.bbox, fragment.bbox)
+                            } else {
+                                (fragment.bbox, line.bbox)
+                            };
+                            bbox.x0 >= left.x1 - max_size * 0.5
+                                && bbox.x1 <= right.x0 + max_size * 0.5
+                                && bbox.width() > (right.x0 - left.x1) * 0.4
+                                && bbox.y0 < line.baseline + max_size
+                                && bbox.y1 > line.baseline - max_size * 0.5
+                        })))
         });
 
         if let Some(line) = candidate {
@@ -122,6 +177,79 @@ fn merge_line_fragments(fragments: Vec<LineAcc>) -> Vec<LineAcc> {
         }
     }
     merged
+}
+
+fn merge_script_fragments(mut lines: Vec<LineAcc>) -> Vec<LineAcc> {
+    // Superscripts and subscripts often lie outside the baseline tolerance.
+    // Attach them before filtering short fragments or identifying paragraphs,
+    // so an inline R^4 is moved as a single object, including its exponent.
+    let mut order: Vec<_> = (0..lines.len()).collect();
+    order.sort_by(|&a, &b| lines[a].font_size.total_cmp(&lines[b].font_size));
+    for index in order {
+        if lines[index].glyphs.is_empty() {
+            continue;
+        }
+        let script = &lines[index];
+        let accent_piece = script.bbox.height() < script.font_size * 0.6
+            && script.glyphs.iter().all(|g| g.text.chars().all(is_accent));
+        let math_piece = script.glyphs.iter().any(is_math_glyph)
+            && script.glyphs.iter().all(|g| {
+                is_math_glyph(g)
+                    || g.font_size < script.font_size * 0.8
+                    || g.text.chars().all(|ch| !ch.is_alphabetic())
+            });
+        let candidate = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, line)| {
+                *i != index
+                    && !line.glyphs.is_empty()
+                    && (script.angle - line.angle).abs() < 0.1
+                    && horizontal_gap(script.bbox, line.bbox) < line.font_size * 1.1
+                    && ((script.font_size < line.font_size * 0.86
+                        && ((script.bbox.width() < line.font_size * 4.5
+                            && script.glyphs.iter().map(|g| g.text.chars().count()).sum::<usize>() <= 12)
+                            // Numerators and textual scripts can be wider than
+                            // a few glyphs. Bind them to the surrounding line
+                            // when their entire horizontal extent lies inside it.
+                            || (script.glyphs.iter().any(is_math_glyph)
+                                && script.bbox.x0 >= line.bbox.x0
+                                && script.bbox.x1 <= line.bbox.x1
+                                && script.bbox.width() < line.bbox.width() * 0.85))
+                        && (script.baseline - line.baseline).abs() < line.font_size * 0.85)
+                        || (accent_piece
+                            && line.glyphs.iter().any(|base| {
+                                base.text.chars().any(char::is_alphabetic)
+                                    && script.bbox.horizontal_overlap(base.bbox) > 0.5
+                                    && script.bbox.y0 >= base.bbox.y1 - line.font_size * 0.2
+                                    && script.bbox.y0 <= base.bbox.y1 + line.font_size * 0.5
+                            }))
+                        || (math_piece
+                            && script.glyphs.iter().map(|g| g.text.len()).sum::<usize>() <= 20
+                            && line.bbox.width() > script.bbox.width() + line.font_size * 1.5
+                            && script.bbox.y1.min(line.bbox.y1) - script.bbox.y0.max(line.bbox.y0)
+                                > script.bbox.height().min(line.bbox.height()) * 0.25))
+            })
+            .min_by(|(_, a), (_, b)| {
+                let distance = |line: &LineAcc| {
+                    let overlap =
+                        script.bbox.y1.min(line.bbox.y1) - script.bbox.y0.max(line.bbox.y0);
+                    // TeX extension fonts put a delimiter's origin far above
+                    // its visible ink. Match that ink, not its nominal baseline.
+                    -overlap / script.bbox.height().min(line.bbox.height()).max(0.1)
+                        + horizontal_gap(script.bbox, line.bbox) / line.font_size * 0.05
+                };
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|(i, _)| i);
+        if let Some(target) = candidate {
+            let glyphs = std::mem::take(&mut lines[index].glyphs);
+            lines[target].bbox = lines[target].bbox.union(lines[index].bbox);
+            lines[target].glyphs.extend(glyphs);
+        }
+    }
+    lines.retain(|line| !line.glyphs.is_empty());
+    lines
 }
 
 fn build_line(mut line: LineAcc) -> Option<TextLine> {
@@ -208,8 +336,20 @@ fn build_line(mut line: LineAcc) -> Option<TextLine> {
     }
 
     let bbox = line.bbox;
-    let baseline = line.baseline;
-    let font_size = line.font_size;
+    // A single large delimiter must not turn an ordinary prose line into a
+    // heading, or move its baseline away from the surrounding text.
+    let mut prose: Vec<_> = line
+        .glyphs
+        .iter()
+        .filter(|g| !is_math_glyph(g) && g.text.chars().any(|ch| ch.is_alphabetic()))
+        .collect();
+    prose.sort_by(|a, b| a.font_size.total_cmp(&b.font_size));
+    let (baseline, font_size) = if prose.len() >= 4 {
+        let dominant = prose[prose.len() / 2];
+        (dominant.origin_y, dominant.font_size)
+    } else {
+        (line.baseline, line.font_size)
+    };
     let math_ratio = if total_glyphs == 0 {
         0.0
     } else {
@@ -259,7 +399,7 @@ pub(super) fn filter_layout_artifacts(lines: &mut Vec<TextLine>, frame: PageFram
     });
 }
 
-pub(super) fn assign_columns(lines: &mut [TextLine], frame: PageFrame) {
+pub(super) fn assign_columns(lines: &mut Vec<TextLine>, frame: PageFrame) {
     let mid = frame.center_x();
     let gutter_margin = frame.width * 0.035;
     let narrow: Vec<&TextLine> = lines
@@ -279,6 +419,44 @@ pub(super) fn assign_columns(lines: &mut [TextLine], frame: PageFrame) {
         .filter(|line| line.bbox.center_x() >= mid)
         .count();
     let two_columns = left >= 3 && right >= 3;
+    if two_columns {
+        let mut split = Vec::new();
+        for line in std::mem::take(lines) {
+            // Aligned lines in adjacent columns can be closer than the normal
+            // word-fragment tolerance. Split at the established gutter before
+            // building paragraphs, including adjacent table/figure captions.
+            let boundary = line
+                .glyphs
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| {
+                    let center = (pair[0].bbox.x1 + pair[1].bbox.x0) * 0.5;
+                    (center - mid).abs() < frame.width * 0.1
+                        && pair[1].bbox.x0 - pair[0].bbox.x1 > line.font_size * 1.1
+                })
+                .max_by(|(_, a), (_, b)| {
+                    (a[1].bbox.x0 - a[0].bbox.x1).total_cmp(&(b[1].bbox.x0 - b[0].bbox.x1))
+                })
+                .map(|(i, _)| i + 1);
+            if let Some(boundary) = boundary.filter(|&i| i >= 3 && line.glyphs.len() - i >= 3) {
+                for glyphs in [&line.glyphs[..boundary], &line.glyphs[boundary..]] {
+                    let bbox = glyphs.iter().map(|g| g.bbox).reduce(BBox::union).unwrap();
+                    if let Some(part) = build_line(LineAcc {
+                        glyphs: glyphs.to_vec(),
+                        bbox,
+                        baseline: line.baseline,
+                        font_size: line.font_size,
+                        angle: glyphs[0].angle,
+                    }) {
+                        split.push(part);
+                    }
+                }
+            } else {
+                split.push(line);
+            }
+        }
+        *lines = split;
+    }
     for line in lines {
         let crosses_gutter =
             line.bbox.x0 < mid - gutter_margin && line.bbox.x1 > mid + gutter_margin;
@@ -302,11 +480,111 @@ pub(super) fn is_formula_line(line: &TextLine) -> bool {
     let text_len = line.text.chars().count();
     let math_ops = line.text.chars().filter(|ch| is_math_operator(*ch)).count();
     let display_like = text_len <= 40 && math_ops >= 2 && char_ratio > 0.08;
+    let prose_word = line.spans.iter().filter(|span| !span.formula).any(|span| {
+        span.text
+            .split(|ch: char| !ch.is_alphabetic())
+            .any(|word| word.chars().count() >= 3 && !is_named_math_operator(word))
+    });
+    if (span_formula && !prose_word) || is_named_math_operator(line.text.trim()) {
+        return true;
+    }
+
+    // Even a short sentence introducing an equation can have a high math
+    // ratio. Count its ordinary letters separately: inline formula handling
+    // preserves the expression while the surrounding prose is translated.
+    let prose_letters = line
+        .spans
+        .iter()
+        .filter(|span| !span.formula)
+        .map(|span| span.text.chars().filter(|ch| ch.is_alphabetic()).count())
+        .sum::<usize>();
+    let mut opening = line.text.split_whitespace();
+    let sentence_subject = opening
+        .next()
+        .is_some_and(|word| matches!(word, "We" | "we"))
+        && opening.next().is_some_and(|word| {
+            word.len() >= 3
+                && word.chars().all(|ch| ch.is_ascii_alphabetic())
+                && !is_named_math_operator(word)
+        });
+    let mut words = line.text.split_whitespace();
+    let sentence_intro = line.text.trim_end().ends_with(':')
+        && (0..2).all(|_| {
+            words.next().is_some_and(|word| {
+                word.len() >= 2
+                    && word.chars().all(|ch| ch.is_ascii_alphabetic())
+                    && !is_named_math_operator(word)
+            })
+        });
+    let prose_words = line
+        .text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| ch.is_ascii_punctuation()))
+        .filter(|word| {
+            word.len() >= 2
+                && word.chars().all(|ch| ch.is_alphabetic())
+                && !is_named_math_operator(word)
+        })
+        .count();
+    if (prose_letters >= 24 && (char_ratio < 0.2 || prose_words >= 4))
+        || (prose_letters >= 16 && prose_words >= 3)
+        || (sentence_subject && prose_word && prose_letters >= 5)
+        || (sentence_intro && prose_word && prose_letters >= 12 && char_ratio < 0.35)
+    {
+        return false;
+    }
+    if span_formula
+        && line
+            .text
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .count()
+            <= 3
+        && (math_ops >= 1 || char_ratio > 0.08)
+    {
+        return true;
+    }
+    if line.text.chars().any(|ch| ch.is_ascii_digit())
+        && line.text.chars().all(|ch| {
+            ch.is_whitespace()
+                || ch.is_ascii_digit()
+                || ch.is_ascii_punctuation()
+                || is_math_char(ch)
+                || is_math_operator(ch)
+        })
+    {
+        return true;
+    }
 
     span_formula && (math_ratio > 0.35 || char_ratio > 0.2)
         || math_ratio > 0.55
         || (char_ratio > 0.35 && line.text.chars().filter(|c| is_math_char(*c)).count() >= 2)
         || display_like
+}
+
+/// A large extensible brace binds every row of a cases expression. Its text
+/// rows may contain ordinary words, but moving one row independently destroys
+/// the equation. Preserve the original objects throughout the brace's height.
+pub(super) fn protect_cases(lines: &mut [TextLine]) {
+    let braces: Vec<_> = lines
+        .iter()
+        .flat_map(|line| &line.glyphs)
+        .filter(|g| g.text == "{" && g.bbox.height() > g.font_size * 1.7)
+        .map(|g| (g.bbox, g.font_size))
+        .collect();
+    for (brace, size) in braces {
+        for line in lines.iter_mut() {
+            if line.bbox.y0 < brace.y1
+                && line.bbox.y1 > brace.y0
+                && line.bbox.x1 > brace.x0
+                && line.font_size <= size * 1.15
+                && (line.bbox.x0 >= brace.x0 - size * 0.5
+                    || line.spans.iter().any(|span| span.formula))
+            {
+                line.formula = true;
+            }
+        }
+    }
 }
 
 fn horizontal_gap(a: BBox, b: BBox) -> f64 {

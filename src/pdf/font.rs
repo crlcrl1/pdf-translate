@@ -30,6 +30,7 @@ pub struct FontMetrics {
     pub italic_angle: f64,
     pub char_to_gid: HashMap<char, u16>,
     pub gid_advance: Vec<u16>,
+    pub char_vertical_bounds: HashMap<char, (f64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +154,7 @@ impl FontSource {
         }
 
         let mut char_to_gid = HashMap::new();
+        let mut char_vertical_bounds = HashMap::new();
         let mut unique = BTreeSet::new();
         unique.insert(' ');
         unique.insert('?');
@@ -160,6 +162,15 @@ impl FontSource {
         for ch in unique {
             if let Some(gid) = face.glyph_index(ch) {
                 char_to_gid.insert(ch, gid.0);
+                if let Some(bounds) = face.glyph_bounding_box(gid) {
+                    char_vertical_bounds.insert(
+                        ch,
+                        (
+                            f64::from(bounds.y_min) / units_per_em,
+                            f64::from(bounds.y_max) / units_per_em,
+                        ),
+                    );
+                }
             }
         }
 
@@ -190,6 +201,7 @@ impl FontSource {
             italic_angle: f64::from(face.italic_angle()),
             char_to_gid,
             gid_advance,
+            char_vertical_bounds,
         })
     }
 

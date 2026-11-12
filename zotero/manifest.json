@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "PDF Translate",
+  "version": "0.1.0",
+  "description": "Translate PDF attachments with the pdf-translate CLI and open the result in Zotero.",
+  "author": "crl",
+  "icons": {
+    "48": "content/icon.svg",
+    "96": "content/icon.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "pdf-translate@crl.local",
+      "update_url": "https://github.com/crlcrl1/pdf-translate/releases/latest/download/update.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.9.9"
+    }
+  }
+}

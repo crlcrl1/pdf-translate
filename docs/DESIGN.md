@@ -8,7 +8,7 @@
 默认场景：
 
 - 输入以数字版英文论文为主（arXiv、IEEE、ACM、Springer、Nature 等）。
-- 输出单语译文 PDF，版面、图、表、公式保持原位；双语对照后续再加。
+- 输出单语译文 PDF，版面、图、表、公式保持原位；也可用 `--bilingual` 输出原文/译文左右并排的双语 PDF。
 - 翻译走任意 OpenAI 兼容接口（OpenAI、DeepSeek、GLM、Qwen、Ollama、vLLM 等）。
 - 运行时只有一个二进制，不依赖 Python、uv、外部脚本或系统 PDF 工具。
 - 第一阶段做 CLI 和核心引擎；GUI、Zotero 插件等核心稳定后再接。
@@ -317,7 +317,7 @@ pub struct Translation {
 
 ### Stage 3：质量与工程化（2–3 周）
 
-1. 双语输出：原文页和译文页并排或交替，两页都作为 Form XObject 组合。
+1. 双语输出：原文页和译文页并排或交替，两页都作为 Form XObject 组合。（已实现第一版：`--bilingual` 将原文/译文页左右并排。）
 2. 选择翻译范围：`--pages`、正文或全部、跳过参考文献和附录。
 3. 断点续传：每段译文落盘，失败重跑不重复请求；会话状态写进 `session.json`。
 4. 术语表、自动术语抽取，以及标题、章节、前后段之类的上下文。
@@ -334,6 +334,7 @@ pub struct Translation {
     - 在 PDF.js 阅读器上叠加可点击的段落框；
     - 右键段落，调用 `POST /sessions/{id}/paragraphs/{pid}/translate`；
     - 译文写回同一页，或导出整本译文 PDF。
+- 当前进度：插件（`zotero/`）直接调用 CLI 做整篇翻译、显示进度，并导入单独的双语对照 PDF 子附件；再次点击时优先打开已有双语附件或缓存，不重复翻译。本地服务、段落框和段落级翻译尚未实现。
 - 发布：GitHub Releases 提供多平台二进制；Zotero XPI 里内置对应平台的二进制，或者首次使用时下载。
 
 ### Stage 5（可选）：扫描件 OCR（3–4 周）

@@ -29,6 +29,7 @@ pub(super) struct Instrumenter<'a> {
     pub plans: Vec<Plan>,
     visiting: HashSet<ObjectId>,
     forms: usize,
+    graphic_forms: HashSet<ObjectId>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +54,7 @@ impl<'a> Instrumenter<'a> {
             plans: Vec::new(),
             visiting: HashSet::new(),
             forms: 0,
+            graphic_forms: HashSet::new(),
         }
     }
 
@@ -166,6 +168,41 @@ impl<'a> Instrumenter<'a> {
                     self.calls += 1;
                     append_probe(&mut instrumented, &op, &probe_name, id);
                     Some(id)
+                } else if op.operator == "S"
+                    || op.operator == "BI"
+                    || (op.operator == "Do"
+                        && op
+                            .operands
+                            .first()
+                            .and_then(|o| o.as_name().ok())
+                            .and_then(|name| original_xobjects.get(name).ok())
+                            .and_then(|o| o.as_reference().ok())
+                            .and_then(|id| self.doc.get_object(id).ok())
+                            .and_then(|o| o.as_stream().ok())
+                            .is_some_and(|stream| {
+                                stream
+                                    .dict
+                                    .get(b"Subtype")
+                                    .and_then(Object::as_name)
+                                    .is_ok_and(|name| name == b"Image")
+                            }))
+                {
+                    ensure!(
+                        self.calls < MAX_TEXT_OPERATIONS,
+                        "too many operations to rewrite safely"
+                    );
+                    let id = self.calls;
+                    self.calls += 1;
+                    instrumented.push(Operation::new(
+                        "BDC",
+                        vec![
+                            Object::Name(TRACE_TAG.to_vec()),
+                            dictionary! {"Id" => id as i64, "Probe" => false}.into(),
+                        ],
+                    ));
+                    instrumented.push(op.clone());
+                    instrumented.push(Operation::new("EMC", vec![]));
+                    Some(id)
                 } else {
                     instrumented.push(op.clone());
                     None
@@ -225,6 +262,20 @@ impl<'a> Instrumenter<'a> {
             return Ok(None);
         }
         let source = source.clone();
+        // Plot markers can invoke one text-free Form tens of thousands of
+        // times. Keep those leaves shared; only text-bearing invocations need
+        // independent rewrite plans. Do not skip nested Forms or Type3 text.
+        let data = source.get_plain_content_with_limit(MAX_CONTENT_STREAM_BYTES)?;
+        if self.graphic_forms.contains(&id)
+            || !Content::decode(&data)?
+                .operations
+                .iter()
+                .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"" | "Do"))
+        {
+            self.graphic_forms.insert(id);
+            xobjects.set(name.to_vec(), object.clone());
+            return Ok(None);
+        }
         self.forms += 1;
         ensure!(
             self.forms <= MAX_FORM_INVOCATIONS,
@@ -237,7 +288,6 @@ impl<'a> Instrumenter<'a> {
         let child_resources = resolved_dict(self.doc, source.dict.get(b"Resources").ok())
             .unwrap_or_else(|| resources.clone());
         let child_id = self.doc.new_object_id();
-        let data = source.get_plain_content_with_limit(MAX_CONTENT_STREAM_BYTES)?;
         let built = self.stream(
             &data,
             child_resources,
