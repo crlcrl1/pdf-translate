@@ -24,6 +24,7 @@ pub struct TranslateRequest {
     pub compose: ComposeOptions,
     pub font: Option<PathBuf>,
     pub bold_font: Option<PathBuf>,
+    pub italic_font: Option<PathBuf>,
     pub translate_references: bool,
     pub bilingual: bool,
     pub dump_layout: Option<PathBuf>,
@@ -116,6 +117,7 @@ impl TranslateRequest {
             },
             font: args.font.or(config.typeset.font.clone()),
             bold_font: args.bold_font.or(config.typeset.bold_font.clone()),
+            italic_font: args.italic_font.or(config.typeset.italic_font.clone()),
             translate_references: args.translate_references,
             bilingual: args.bilingual,
             dump_layout: args.dump_layout,
@@ -255,11 +257,23 @@ pub fn translate_with_progress(
     if let Some(bold) = &bold_font_source {
         eprintln!("bold font: {} (index {})", bold.path.display(), bold.index);
     }
+    let italic_font_source =
+        pdf::find_default_italic_font(request.italic_font.as_deref(), &font_source);
+    if let Some(italic) = &italic_font_source {
+        eprintln!(
+            "italic font: {} (index {})",
+            italic.path.display(),
+            italic.index
+        );
+    }
+    let symbol_font_source = pdf::find_default_symbol_font();
 
     let (typeset, typeset_stats) = typeset::typeset_document(
         &document,
         &font_source,
         bold_font_source.as_ref(),
+        italic_font_source.as_ref(),
+        symbol_font_source.as_ref(),
         &request.typeset,
     )?;
     eprintln!(
@@ -372,6 +386,7 @@ mod tests {
             },
             font: None,
             bold_font: None,
+            italic_font: None,
             translate_references: false,
             bilingual: false,
             dump_layout: None,

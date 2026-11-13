@@ -52,11 +52,18 @@ pub(super) fn chat_completion(
     } else {
         ""
     };
+    let color_rules = if pieces(text).any(|piece| matches!(piece, Piece::Color(_))) {
+        "Keep every <cRRGGBBAA>...</c> color span paired, with its original hexadecimal code. \
+         Translate its words and keep the color only on those translated words. \
+         Never extend a colored citation to ordinary prose, drop a span, or leave it empty."
+    } else {
+        ""
+    };
     let mut system = format!(
         "You are a professional academic translator. Translate English academic text into {target}. \
          Translate the complete text, including every qualifier in a title or heading. \
          Use only {target} for ordinary prose; retain foreign-script names only when present in the source. \
-         Preserve citations, numbers, URLs, code identifiers and technical terms. {placeholder_rules} {literal_rules} {emphasis_rules} \
+         Preserve citations, numbers, URLs, code identifiers and technical terms. {placeholder_rules} {literal_rules} {emphasis_rules} {color_rules} \
          Output only the translation.",
     );
     let examples = [
@@ -71,6 +78,10 @@ pub(super) fn chat_completion(
         (
             text.contains("<i>"),
             "Italic: The <i>stable</i> solution. -> <i>稳定的</i>解。",
+        ),
+        (
+            !color_rules.is_empty(),
+            "Color: <c0000ffff>Smith</c> reports a result. -> <c0000ffff>Smith</c>报告了一项结果。",
         ),
         (
             !literal_rules.is_empty(),
@@ -229,7 +240,7 @@ pub(super) fn chat_completion(
             }
         }
     }
-    if invalid_content && (!formulas.is_empty() || text.contains("<b>") || text.contains("<i>")) {
+    if invalid_content && pieces(text).any(|piece| !matches!(piece, Piece::Text(_))) {
         // Some local models repeatedly drop or duplicate placeholders. As a
         // bounded fallback, translate the prose between them and reinsert the
         // original objects ourselves; never discard a formula to accept a reply.
@@ -291,6 +302,7 @@ fn sentence_chunks(text: &str) -> Option<Vec<String>> {
             match piece {
                 Piece::Bold(on) => style.bold = on,
                 Piece::Italic(on) => style.italic = on,
+                Piece::Color(color) => style.color = color,
                 _ => {}
             }
         }
@@ -301,6 +313,7 @@ fn sentence_chunks(text: &str) -> Option<Vec<String>> {
         });
         if !style.bold
             && !style.italic
+            && style.color.is_none()
             && current.chars().count() >= 100
             && visible.trim_end().ends_with(['.', '!', '?'])
             && starts_sentence
@@ -435,9 +448,10 @@ fn translation_chunks(text: &str, limit: usize) -> Option<Vec<String>> {
     let mut count = 0;
     let mut bold = false;
     let mut italic = false;
+    let mut color = None;
     for word in text.split_inclusive(char::is_whitespace) {
         let length = word.chars().count();
-        if count > 0 && count + length > limit && !bold && !italic {
+        if count > 0 && count + length > limit && !bold && !italic && color.is_none() {
             chunks.push(std::mem::take(&mut current).trim().to_owned());
             count = 0;
         }
@@ -447,10 +461,16 @@ fn translation_chunks(text: &str, limit: usize) -> Option<Vec<String>> {
             match piece {
                 Piece::Bold(on) => bold = on,
                 Piece::Italic(on) => italic = on,
+                Piece::Color(next) => color = next,
                 _ => {}
             }
         }
-        if count >= limit / 2 && !bold && !italic && word.trim_end().ends_with(['.', '!', '?']) {
+        if count >= limit / 2
+            && !bold
+            && !italic
+            && color.is_none()
+            && word.trim_end().ends_with(['.', '!', '?'])
+        {
             chunks.push(std::mem::take(&mut current).trim().to_owned());
             count = 0;
         }
@@ -478,6 +498,7 @@ fn translate_around_formulas(
             }
             Piece::Bold(on) => output.push_str(if on { "<b>" } else { "</b>" }),
             Piece::Italic(on) => output.push_str(if on { "<i>" } else { "</i>" }),
+            Piece::Color(color) => output.push_str(&crate::markup::color_tag(color)),
         }
     }
     Ok(output)
@@ -760,6 +781,29 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn color_spans_survive_fragment_fallback_and_chunk_boundaries() {
+        let source = "<c00008cff><b>Smith</b></c> reports <f1>.";
+        let output = translate_around_formulas(source, |part| {
+            Ok(if part == "Smith" { "Smith" } else { "报告" }.into())
+        })
+        .unwrap();
+        assert_eq!(output, "<c00008cff><b>Smith</b></c>报告<f1>.");
+        assert!(validate_translation(source, &output, &["f1".into()]).is_some());
+        let source = format!(
+            "<c00008cff>{}</c> {}",
+            "A sentence. ".repeat(20),
+            "Other prose. ".repeat(20)
+        );
+        for chunks in [
+            translation_chunks(&source, 300).unwrap(),
+            sentence_chunks(&source).unwrap(),
+        ] {
+            assert!(chunks[0].contains("</c>"));
+            assert!(validate_translation(&source, &chunks.join(" "), &[]).is_some());
+        }
     }
 
     #[test]

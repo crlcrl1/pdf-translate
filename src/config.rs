@@ -71,6 +71,8 @@ pub struct TypesetConfig {
     pub font: Option<PathBuf>,
     /// Optional bold CJK font.
     pub bold_font: Option<PathBuf>,
+    /// Optional italic CJK font (a Kaiti face works well for Chinese).
+    pub italic_font: Option<PathBuf>,
     /// Smallest font scale allowed when fitting translations.
     pub min_scale: Option<f64>,
     /// How much vertical space a paragraph may grow into.
@@ -170,6 +172,7 @@ mod tests {
             [typeset]
             font = "/tmp/font.ttf"
             bold_font = "/tmp/bold.ttf"
+            italic_font = "/tmp/italic.ttf"
             min_scale = 0.6
             max_expand = 1.3
             line_height = 1.1
@@ -195,6 +198,10 @@ mod tests {
         assert_eq!(
             config.typeset.bold_font.as_deref(),
             Some(Path::new("/tmp/bold.ttf"))
+        );
+        assert_eq!(
+            config.typeset.italic_font.as_deref(),
+            Some(Path::new("/tmp/italic.ttf"))
         );
         assert_eq!(config.typeset.min_scale, Some(0.6));
         assert_eq!(config.typeset.max_expand, Some(1.3));

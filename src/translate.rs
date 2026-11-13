@@ -229,6 +229,7 @@ fn translate_task(
     client: Option<&Client>,
     cache: &HashMap<String, String>,
 ) -> Result<(String, bool)> {
+    // v35 carries per-span colors; uncolored v34 replies can still migrate.
     // v34 binds list symbols and migrates literal-prefix replies without
     // retranslating the prose. Earlier replies still need all current checks.
     // v32 also uses a positive target-language instruction on the final retry.
@@ -236,7 +237,7 @@ fn translate_task(
     // v30 distinguishes Chinese prose from other CJK scripts. All migrated
     // replies must pass the current language, markup and list-label checks.
     let compatible_keys = (!options.fake).then(|| {
-        [b"v32\0", b"v31\0", b"v30\0", b"v29\0", b"v28\0"].map(|version| {
+        [b"v34\0", b"v32\0", b"v31\0", b"v30\0", b"v29\0", b"v28\0"].map(|version| {
             translation_key_with_version(options, &task.text, &task.context, version)
         })
     });
@@ -425,6 +426,7 @@ fn translate_structured(
                     offset += if on { 3 } else { 4 };
                 }
                 Piece::Italic(on) => offset += if on { 3 } else { 4 },
+                Piece::Color(color) => offset += crate::markup::color_tag(color).len(),
                 Piece::Formula(id) => offset += id.len() + 2,
                 Piece::Text(part) if !bold && !part.trim().is_empty() => break,
                 Piece::Text(part) => offset += part.len(),
@@ -639,7 +641,7 @@ fn translation_context(
 }
 
 fn translation_key(options: &TranslationOptions, text: &str, context: &str) -> String {
-    translation_key_with_version(options, text, context, b"v34\0")
+    translation_key_with_version(options, text, context, b"v35\0")
 }
 
 fn previous_cache_version(text: &str) -> &'static [u8] {

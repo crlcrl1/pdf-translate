@@ -171,6 +171,8 @@ pub enum Align {
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
+    /// None inherits the paragraph's dominant color in inline markup.
+    pub color: Option<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +246,7 @@ impl Paragraph {
         let mut total = 0;
         let mut bold = 0;
         let mut italic = 0;
+        let mut colors = std::collections::BTreeMap::new();
         for span in self
             .lines(lines)
             .flat_map(|line| &line.spans)
@@ -251,6 +254,7 @@ impl Paragraph {
         {
             let count = span.text.chars().filter(|ch| ch.is_alphanumeric()).count();
             total += count;
+            *colors.entry(span.color).or_insert(0) += count;
             if span.bold {
                 bold += count;
             }
@@ -265,6 +269,10 @@ impl Paragraph {
             // paragraphs need explicit tags for their actual emphasized runs.
             bold: total > 0 && bold == total,
             italic: total > 0 && italic == total,
+            color: colors
+                .into_iter()
+                .max_by_key(|(color, count)| (*count, std::cmp::Reverse(*color)))
+                .map(|(color, _)| color),
         };
     }
 }
@@ -283,6 +291,8 @@ pub struct PageLayout {
     pub lines: Vec<TextLine>,
     pub paragraphs: Vec<Paragraph>,
     pub images: Vec<ImageBox>,
+    /// Horizontal vector boundaries that constrain translated text expansion.
+    pub rules: Vec<BBox>,
 }
 
 impl Serialize for PageLayout {
@@ -302,7 +312,7 @@ impl Serialize for PageLayout {
                 lines: paragraph.lines(&self.lines).collect(),
             })
             .collect();
-        let mut page = serializer.serialize_struct("PageLayout", 10)?;
+        let mut page = serializer.serialize_struct("PageLayout", 11)?;
         page.serialize_field("index", &self.index)?;
         page.serialize_field("x0", &self.x0)?;
         page.serialize_field("y0", &self.y0)?;
@@ -313,6 +323,7 @@ impl Serialize for PageLayout {
         page.serialize_field("lines", &self.lines)?;
         page.serialize_field("paragraphs", &paragraphs)?;
         page.serialize_field("images", &self.images)?;
+        page.serialize_field("rules", &self.rules)?;
         page.end()
     }
 }

@@ -96,7 +96,7 @@ The plugin settings are under **Edit → Settings → PDF Translate**:
 | Composition mode | `clean` | `clean` or `overlay` |
 | Side-by-side bilingual | on | Add `--bilingual`: original left, translation right |
 | Translate the reference list | off | `--translate-references` |
-| Keep link annotations | off | `--keep-annotations` |
+| Keep link annotations in place | off | `--keep-annotations`; by default link rectangles move with the translation |
 | Fake mode | off | `--fake`, no API call; useful for testing |
 | Extra arguments | empty | Appended to the command; quotes and backslashes work |
 | Config file | empty | Passed as `--config` when set |

@@ -129,11 +129,14 @@ fn analyze_page(page: ExtractedPage) -> PageLayout {
         rebuilt.extend(column_lines);
     }
     lines = rebuilt;
+    lines::split_caption_lines(&mut lines);
     filter_layout_artifacts(&mut lines, frame);
     for line in &mut lines {
         line.formula = is_formula_line(line);
     }
     lines::protect_cases(&mut lines);
+    lines::protect_numbered_equations(&mut lines, frame);
+    tables::protect_ruled_tables(&mut lines, &page.rules);
     // Display equations often dominate appendix pages. Their small fonts
     // must not make ordinary prose look like large section headings.
     let body_size = body_font_size(&lines);
@@ -145,7 +148,7 @@ fn analyze_page(page: ExtractedPage) -> PageLayout {
     merge_caption_continuations(&mut paragraphs);
     for paragraph in &mut paragraphs {
         paragraph.role = classify_paragraph(paragraph, &lines, page.index, frame, body_size);
-        paragraph.protected = matches!(
+        paragraph.protected |= matches!(
             paragraph.role,
             Role::Formula | Role::Header | Role::Footer | Role::PageNumber
         ) || paragraph.has_formula
@@ -182,6 +185,7 @@ fn analyze_page(page: ExtractedPage) -> PageLayout {
         lines,
         paragraphs,
         images: page.images,
+        rules: page.rules,
     }
 }
 
@@ -219,6 +223,13 @@ mod tests {
     use super::paragraphs::make_paragraph;
     use super::*;
     use crate::model::{BBox, Column, GlyphBox, TextLine, TextSpan};
+
+    const FRAME: PageFrame = PageFrame {
+        x0: 0.0,
+        y0: 0.0,
+        width: 600.0,
+        height: 800.0,
+    };
 
     fn text_glyph(text: &str, x: f64, y: f64) -> GlyphBox {
         GlyphBox {
@@ -493,6 +504,7 @@ mod tests {
             lines: Vec::new(),
             paragraphs: vec![heading, first, continuation],
             images: Vec::new(),
+            rules: Vec::new(),
         }];
         protect_references(&mut pages);
         assert!(pages[0].paragraphs.iter().all(|p| p.protected));
@@ -542,6 +554,7 @@ mod tests {
                 lines: Vec::new(),
                 paragraphs: vec![heading.clone(), entry, continuation.clone()],
                 images: Vec::new(),
+                rules: Vec::new(),
             },
             PageLayout {
                 index: 1,
@@ -555,6 +568,7 @@ mod tests {
                 lines: Vec::new(),
                 paragraphs: vec![continuation],
                 images: Vec::new(),
+                rules: Vec::new(),
             },
             PageLayout {
                 index: 2,
@@ -568,6 +582,7 @@ mod tests {
                 lines: Vec::new(),
                 paragraphs: vec![appendix, body],
                 images: Vec::new(),
+                rules: Vec::new(),
             },
         ];
         protect_references(&mut pages);
@@ -613,6 +628,7 @@ mod tests {
             lines: Vec::new(),
             paragraphs: vec![heading, entry, appendix, body],
             images: Vec::new(),
+            rules: Vec::new(),
         }];
         protect_references(&mut pages);
         assert!(pages[0].paragraphs[0].protected);
@@ -783,6 +799,186 @@ mod tests {
                 .unwrap()
                 .contains("and (<f2> is positive)")
         );
+    }
+
+    #[test]
+    fn inner_products_keep_scripted_italic_operands_and_closing_delimiters() {
+        // Palatino math uses the same italic face as prose, not a dedicated
+        // math font. The T and v around the small z must still belong to the
+        // inner product, including when TeX adds space after its comma.
+        for comma_gap in [0.0, 3.5] {
+            let mut glyphs = Vec::new();
+            let mut x = 0.0;
+            for (text, font, size) in [
+                ("Its coefficient ", "Body", 10.0),
+                ("F", "Palatino-Italic", 10.0),
+                ("v", "Palatino-Italic", 7.0),
+                ("(", "CMR10", 10.0),
+                ("z", "Palatino-Italic", 10.0),
+                (") = ", "CMR10", 10.0),
+                ("⟨", "CMSY10", 10.0),
+                ("v", "Palatino-Italic", 10.0),
+                (",", "Body", 10.0),
+                ("T", "Palatino-Italic", 10.0),
+                ("z", "Palatino-Italic", 7.0),
+                ("v", "Palatino-Italic", 10.0),
+                ("⟩", "CMSY10", 10.0),
+                (" is uniformly continuous.", "Body", 10.0),
+            ] {
+                let y = if size < 10.0 { 98.0 } else { 100.0 };
+                let mut run = glyph_run(text, x, y, font);
+                for (index, glyph) in run.iter_mut().enumerate() {
+                    glyph.font_size = size;
+                    glyph.italic = font == "Palatino-Italic";
+                    glyph.sources.push(crate::model::SourceGlyph {
+                        ordinal: glyphs.len() + index,
+                        code: glyph.text.chars().next().unwrap() as u32,
+                        x: glyph.origin_x,
+                        y: glyph.origin_y,
+                    });
+                }
+                glyphs.extend(run);
+                x += text.chars().count() as f64 * 5.0;
+                if text == "," {
+                    x += comma_gap;
+                }
+            }
+            let lines = build_lines(glyphs);
+            let mut paragraph = make_paragraph(&lines, vec![0], 0, 0);
+            attach_inline_formulas(&mut paragraph, &lines);
+            assert_eq!(paragraph.formulas.len(), 1, "{:?}", paragraph.formulas);
+            let formula = &paragraph.formulas[0];
+            assert_eq!(formula.text, "Fv(z)=⟨v,Tzv⟩");
+            assert_eq!(formula.sources.len(), formula.text.chars().count());
+            assert_eq!(formula.sources.last().unwrap().code, '⟩' as u32);
+            assert_eq!(
+                paragraph.prompt_text.as_deref(),
+                Some("Its coefficient <f1> is uniformly continuous.")
+            );
+        }
+    }
+
+    #[test]
+    fn scripted_variables_remain_formulas_without_math_fonts_or_operators() {
+        for font in ["Body-Italic", "Body"] {
+            for (expression, script_y) in [("Txv", 98.0), ("Tx", 98.0), ("L2", 104.0)] {
+                let prefix = "Define ";
+                let mut glyphs = glyph_run(prefix, 0.0, 100.0, "Body");
+                let x = prefix.len() as f64 * 5.0;
+                let mut math = glyph_run(expression, x, 100.0, font);
+                math.iter_mut()
+                    .for_each(|g| g.italic = font.ends_with("Italic"));
+                math[1].font_size = 7.0;
+                math[1].origin_y = script_y;
+                math[1].bbox.y0 = script_y;
+                math[1].bbox.y1 = script_y + 5.0;
+                let bbox = math.iter().map(|g| g.bbox).reduce(BBox::union).unwrap();
+                glyphs.extend(math);
+                glyphs.extend(glyph_run(
+                    " by this limit.",
+                    x + expression.len() as f64 * 5.0,
+                    100.0,
+                    "Body",
+                ));
+                let lines = build_lines(glyphs);
+                let mut paragraph = make_paragraph(&lines, vec![0], 0, 0);
+                attach_inline_formulas(&mut paragraph, &lines);
+                assert_eq!(paragraph.formulas.len(), 1, "{font}: {expression}");
+                assert_eq!(paragraph.formulas[0].text, expression);
+                assert_eq!(paragraph.formulas[0].bbox, bbox);
+                assert_eq!(
+                    paragraph.prompt_text.as_deref(),
+                    Some("Define <f1> by this limit.")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emphasized_words_small_caps_and_footnote_suffixes_are_not_math() {
+        for (word, small, baseline) in [
+            ("Txv", &[][..], 100.0),
+            ("TEXT", &[1, 2, 3][..], 100.0),
+            ("word1", &[4][..], 104.0),
+        ] {
+            let mut glyphs = glyph_run("The label ", 0.0, 100.0, "Body");
+            let mut label = glyph_run(word, 50.0, 100.0, "Body-Italic");
+            for (index, glyph) in label.iter_mut().enumerate() {
+                glyph.italic = true;
+                if small.contains(&index) {
+                    glyph.font_size = 7.0;
+                    glyph.origin_y = baseline;
+                    glyph.bbox.y0 = baseline;
+                    glyph.bbox.y1 = baseline + 5.0;
+                }
+            }
+            glyphs.extend(label);
+            glyphs.extend(glyph_run(
+                " remains ordinary prose.",
+                50.0 + word.len() as f64 * 5.0,
+                100.0,
+                "Body",
+            ));
+            let lines = build_lines(glyphs);
+            let mut paragraph = make_paragraph(&lines, vec![0], 0, 0);
+            attach_inline_formulas(&mut paragraph, &lines);
+            assert!(
+                paragraph.formulas.is_empty(),
+                "{word}: {:?}",
+                paragraph.formulas
+            );
+            assert!(paragraph.prompt_text.as_deref().unwrap().contains(word));
+        }
+    }
+
+    #[test]
+    fn nested_math_delimiters_keep_roman_operands_inside_the_formula() {
+        for expression in [
+            "⟨v,Tzv⟩",
+            "⟪v,Tzv⟫",
+            "⟨v,(Tzv)⟩",
+            "⟨v,[Tzv]⟩",
+            "⟨v,{Tzv}⟩",
+            "⟨v,⟦Tzv⟧⟩",
+            "⟨v,⌈Tzv⌉⟩",
+            "⟨v,⌊Tzv⌋⟩",
+        ] {
+            let source = format!("The coefficient {expression} is continuous.");
+            let mut glyphs = glyph_run(&source, 0.0, 100.0, "Body");
+            for glyph in &mut glyphs {
+                if !glyph.text.is_ascii() {
+                    glyph.font_name = Some("CMSY10".into());
+                }
+            }
+            let lines = build_lines(glyphs);
+            let mut paragraph = make_paragraph(&lines, vec![0], 0, 0);
+            attach_inline_formulas(&mut paragraph, &lines);
+            assert_eq!(paragraph.formulas.len(), 1, "{expression}");
+            assert_eq!(paragraph.formulas[0].text, expression);
+            assert_eq!(
+                paragraph.prompt_text.as_deref(),
+                Some("The coefficient <f1> is continuous.")
+            );
+        }
+    }
+
+    #[test]
+    fn delimited_prose_after_a_formula_stays_translatable() {
+        for prose in ["(the map)", "[see text]", "{a value}", "(see)", "[sic]"] {
+            let mut glyphs = glyph_run("Consider the variable ", 0.0, 100.0, "Body");
+            let x = glyphs.len() as f64 * 5.0;
+            glyphs.extend(glyph_run("x", x, 100.0, "CMMI10"));
+            glyphs.extend(glyph_run(&format!(" {prose}."), x + 5.0, 100.0, "Body"));
+            let lines = build_lines(glyphs);
+            let mut paragraph = make_paragraph(&lines, vec![0], 0, 0);
+            attach_inline_formulas(&mut paragraph, &lines);
+            assert_eq!(paragraph.formulas.len(), 1);
+            assert_eq!(paragraph.formulas[0].text, "x");
+            assert_eq!(
+                paragraph.prompt_text.as_deref(),
+                Some(format!("Consider the variable <f1> {prose}.").as_str())
+            );
+        }
     }
 
     #[test]
@@ -2054,6 +2250,215 @@ mod tests {
                 .any(|paragraph| !paragraph.protected && paragraph.text.contains("Body text")),
             "body text was classified as a protected header: {:?}",
             layout.paragraphs
+        );
+    }
+
+    #[test]
+    fn synthetic_small_caps_use_the_full_size_without_promoting_mixed_case_or_scripts() {
+        for (text, shifted, expected) in [
+            ("A.3 Full Sets Of Prompts", false, 10.0),
+            ("Introduction", false, 10.0),
+            ("Introduction", true, 8.0),
+        ] {
+            let mut glyphs = glyph_run(text, 50.0, 500.0, "Body");
+            for glyph in &mut glyphs {
+                if glyph.text.chars().all(char::is_lowercase) {
+                    glyph.text = glyph.text.to_uppercase();
+                    glyph.font_size = 8.0;
+                    if shifted {
+                        glyph.origin_y -= 2.0;
+                        glyph.bbox.y0 -= 2.0;
+                        glyph.bbox.y1 -= 2.0;
+                    }
+                }
+            }
+            let lines = build_lines(glyphs);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].font_size, expected, "{text}, shifted: {shifted}");
+        }
+        let mut glyphs = glyph_run("An ordinary sentence", 50.0, 500.0, "Body");
+        glyphs[0].font_size = 12.0;
+        assert_eq!(build_lines(glyphs)[0].font_size, 10.0);
+    }
+
+    #[test]
+    fn textual_subscripts_do_not_turn_display_fragments_into_prose() {
+        for label in ["dist", "train", "test"] {
+            let mut glyphs = glyph_run("≤ D", 150.0, 500.0, "Body");
+            let mut subscript = glyph_run(label, 165.0, 498.0, "Body");
+            for g in &mut subscript {
+                g.font_size = 7.0;
+            }
+            glyphs.extend(subscript);
+            let lines = build_lines(glyphs);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].font_size, 10.0);
+            assert!(is_formula_line(&lines[0]), "{}", lines[0].text);
+        }
+        let line =
+            build_lines(glyph_run("We bound D and obtain ≤ 1.", 50.0, 500.0, "Body")).remove(0);
+        assert!(!is_formula_line(&line));
+    }
+
+    #[test]
+    fn interval_endpoints_and_italic_set_names_are_complete_inline_objects() {
+        let mut glyphs = glyph_run("The interval [a,b] in A is closed.", 50.0, 500.0, "Body");
+        for (i, g) in glyphs.iter_mut().enumerate() {
+            if matches!(i, 14 | 16) || g.text == "A" {
+                g.italic = true;
+                g.font_name = Some("Body-Italic".into());
+            }
+        }
+        let lines = build_lines(glyphs);
+        let mut paragraph = make_paragraph(&lines, vec![0], 1, 0);
+        attach_inline_formulas(&mut paragraph, &lines);
+        assert_eq!(
+            paragraph
+                .formulas
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<Vec<_>>(),
+            ["[a,b]", "A"]
+        );
+        assert_eq!(
+            paragraph.prompt_text.as_deref(),
+            Some("The interval <f1> in <f2> is closed.")
+        );
+    }
+
+    #[test]
+    fn mathematical_calls_keep_textual_parameters_and_italic_correction() {
+        let expression = "P(r,a|prompt,question)";
+        let mut formula = glyph_run(expression, 150.0, 500.0, "Body");
+        formula[0].font_name = Some("CMMI10".into());
+        // TeX inserts an italic correction before the opening parenthesis.
+        for g in &mut formula[1..] {
+            g.origin_x += 1.4;
+            g.bbox.x0 += 1.4;
+            g.bbox.x1 += 1.4;
+        }
+        let line = build_lines(formula.clone()).remove(0);
+        assert!(is_formula_line(&line));
+        let mut glyphs = glyph_run("We maximize", 80.0, 500.0, "Body");
+        glyphs.extend(formula);
+        glyphs.extend(glyph_run(" over the parameters.", 261.4, 500.0, "Body"));
+        let lines = build_lines(glyphs);
+        assert!(!is_formula_line(&lines[0]));
+        let mut paragraph = make_paragraph(&lines, vec![0], 1, 0);
+        attach_inline_formulas(&mut paragraph, &lines);
+        assert_eq!(paragraph.formulas.len(), 1);
+        assert_eq!(paragraph.formulas[0].text, expression);
+        assert!(
+            paragraph
+                .prompt_text
+                .unwrap()
+                .contains("over the parameters")
+        );
+    }
+
+    #[test]
+    fn equation_numbers_bind_qualifiers_without_protecting_adjacent_prose() {
+        let mut lines = vec![
+            text_line("We obtain the following bound.", 50.0, 520.0),
+            text_line("1 ≤ f(x) ≤ 2 for almost every x", 180.0, 500.0),
+            text_line("(5.12)", 510.0, 500.0),
+            text_line("The exceptional set can depend on x.", 50.0, 480.0),
+        ];
+        lines[2].bbox.x1 = 540.0;
+        lines::protect_numbered_equations(&mut lines, FRAME);
+        assert!(lines[1].formula);
+        assert!(!lines[0].formula && !lines[3].formula);
+        lines[1].formula = false;
+        lines[2].bbox.x0 = 50.0;
+        lines[2].bbox.x1 = 80.0;
+        lines::protect_numbered_equations(&mut lines, FRAME);
+        assert!(
+            !lines[1].formula,
+            "a numbered list is not an equation number"
+        );
+    }
+
+    #[test]
+    fn ruled_prose_tables_preserve_cells_and_keep_captions_separate_on_either_side() {
+        for above in [true, false] {
+            let caption_y = if above { 620.0 } else { 480.0 };
+            let mut lines = vec![text_line(
+                "Table 2: Example reasoning paths.",
+                50.0,
+                caption_y,
+            )];
+            for y in [580.0, 565.0, 550.0, 535.0, 520.0] {
+                let mut cell = text_line(
+                    "This is a long sentence inside a table cell, with ordinary prose words.",
+                    50.0,
+                    y,
+                );
+                cell.font_size = 9.0;
+                cell.glyphs[0].font_size = 9.0;
+                lines.push(cell);
+            }
+            lines.push(text_line(
+                "Ordinary body text following the table remains translatable.",
+                50.0,
+                440.0,
+            ));
+            let rules = [
+                BBox::new(48.0, 600.0, 295.0, 600.3),
+                BBox::new(48.0, 500.0, 295.0, 500.3),
+            ];
+            tables::protect_ruled_tables(&mut lines, &rules);
+            let paragraphs = build_paragraphs(&lines, 1, FRAME, 10.0);
+            let caption = paragraphs
+                .iter()
+                .find(|p| p.text.starts_with("Table"))
+                .unwrap();
+            assert!(!caption.protected);
+            assert!(!caption.text.contains("inside a table"));
+            assert!(
+                paragraphs
+                    .iter()
+                    .filter(|p| p.text.contains("inside a table"))
+                    .all(|p| p.protected)
+            );
+            assert!(
+                !paragraphs
+                    .iter()
+                    .find(|p| p.text.starts_with("Ordinary"))
+                    .unwrap()
+                    .protected
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_captions_split_without_a_page_wide_column_gutter() {
+        let mut glyphs = glyph_run("Table 3: Scores", 50.0, 500.0, "Body");
+        glyphs.extend(glyph_run("Figure 5: Accuracy", 137.0, 500.0, "Body"));
+        let mut lines = build_lines(glyphs);
+        assert_eq!(lines.len(), 1);
+        lines::split_caption_lines(&mut lines);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Table 3: Scores");
+        assert_eq!(lines[1].text, "Figure 5: Accuracy");
+    }
+
+    #[test]
+    fn an_unruled_numeric_row_does_not_absorb_its_caption() {
+        let mut glyphs = glyph_run("Unweighted sum (majority vote)", 50.0, 500.0, "Body");
+        glyphs.extend(glyph_run("74.4 ± 0.1", 215.0, 500.0, "Body"));
+        glyphs.extend(glyph_run(
+            "Table 1: Accuracy comparison.",
+            50.0,
+            486.0,
+            "Body",
+        ));
+        let lines = build_lines(glyphs);
+        let paragraphs = build_paragraphs(&lines, 1, FRAME, 10.0);
+        assert!(
+            paragraphs
+                .iter()
+                .any(|p| p.text == "Table 1: Accuracy comparison."),
+            "{paragraphs:?}"
         );
     }
 }

@@ -34,7 +34,7 @@ impl Row<'_> {
     }
 }
 
-fn has_column_gap(line: &TextLine) -> bool {
+pub(super) fn has_column_gap(line: &TextLine) -> bool {
     let mut glyphs: Vec<_> = line
         .glyphs
         .iter()
@@ -44,6 +44,81 @@ fn has_column_gap(line: &TextLine) -> bool {
     glyphs
         .windows(2)
         .any(|pair| pair[1].bbox.x0 - pair[0].bbox.x1 > line.font_size * 1.3)
+}
+
+/// Table borders provide stronger evidence than the wording of their cells.
+/// Infer them before paragraph assembly so a prose cell cannot absorb its
+/// caption (or be absorbed by a caption above a single-column example table).
+pub(super) fn protect_ruled_tables(lines: &mut [TextLine], rules: &[BBox]) {
+    let mut regions = Vec::new();
+    for (index, caption) in lines.iter().enumerate() {
+        if super::paragraphs::caption_kind(&caption.text) != Some(true) {
+            continue;
+        }
+        let nearest = rules
+            .iter()
+            .filter_map(|rule| {
+                let distance = if rule.y0 >= caption.bbox.y1 {
+                    rule.y0 - caption.bbox.y1
+                } else if rule.y1 <= caption.bbox.y0 {
+                    caption.bbox.y0 - rule.y1
+                } else {
+                    return None;
+                };
+                (distance < caption.font_size * 3.0
+                    && rule.width() > caption.font_size * 8.0
+                    && rule.horizontal_overlap(caption.bbox) > 0.8)
+                    .then_some((rule, distance))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((&near, _)) = nearest else { continue };
+        let above = near.y0 >= caption.bbox.y1;
+        let mut borders: Vec<_> = rules
+            .iter()
+            .filter(|rule| {
+                (rule.x0 - near.x0).abs() < 2.0
+                    && (rule.x1 - near.x1).abs() < 2.0
+                    && if above {
+                        rule.y0 > near.y1
+                    } else {
+                        rule.y1 < near.y0
+                    }
+            })
+            .collect();
+        borders.sort_by(|a, b| (a.y0 - near.y0).abs().total_cmp(&(b.y0 - near.y0).abs()));
+        let mut outer = near;
+        for &border in borders {
+            let band = outer.union(border);
+            let crosses_body = lines.iter().enumerate().any(|(i, line)| {
+                i != index
+                    && line.bbox.y0 >= band.y0
+                    && line.bbox.y1 <= band.y1
+                    && line.bbox.horizontal_overlap(band) > 0.5
+                    && (super::paragraphs::caption_kind(&line.text).is_some()
+                        || (line.font_size >= caption.font_size * 0.98
+                            && line.text.chars().filter(|ch| ch.is_alphabetic()).count() > 45
+                            && !has_column_gap(line)))
+            });
+            if crosses_body {
+                break;
+            }
+            outer = border;
+        }
+        let region = near.union(outer);
+        if region.height() > caption.font_size {
+            regions.push(region);
+        }
+    }
+    for line in lines {
+        for glyph in &mut line.glyphs {
+            glyph.protected |= regions.iter().any(|region| {
+                glyph.bbox.x0 >= region.x0 - 1.0
+                    && glyph.bbox.x1 <= region.x1 + 1.0
+                    && glyph.bbox.y0 >= region.y0
+                    && glyph.bbox.y1 <= region.y1
+            });
+        }
+    }
 }
 
 /// Find the adjacent run of table rows, including single-cell group headers.

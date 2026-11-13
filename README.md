@@ -57,7 +57,7 @@ The default pipeline is:
    with [hayro](https://crates.io/crates/hayro).
 2. **Analyze** lines, paragraphs, columns, headings, formulas, footnotes, headers/footers and references with geometric
    heuristics.
-3. **Translate** each paragraph via `/chat/completions`, preserving citations, numbers, URLs and `<fN>` / `<b>` / `<i>`
+3. **Translate** each paragraph via `/chat/completions`, preserving citations, numbers, URLs and `<fN>` / `<b>` / `<i>` / `<cRRGGBBAA>`
    markers. Results are cached in `$XDG_CACHE_HOME/pdf-translate/translations.json` (or
    `~/.cache/pdf-translate/translations.json`).
 4. **Typeset** the translation with a subset of Noto Serif CJK SC: wrap, justify, shrink to fit, and fall back to the
@@ -79,12 +79,22 @@ cargo build --release
 # binary: target/release/pdf-translate
 ```
 
-The default build embeds a zstd-compressed Noto Serif CJK SC Regular face (roughly a 30 MB binary). Bold text uses
-synthetic bold by default. To embed a real bold face (roughly 48 MB):
+The default build embeds a zstd-compressed Noto Serif CJK SC Regular face plus FandolKai as a real italic face
+(roughly 35 MB binary). Bold text uses synthetic bold by default. To embed a real bold face (roughly 53 MB):
 
 ```bash
 cargo build --release --features embedded-bold-font
 ```
+
+Noto Serif CJK has no italic face, and Kaiti is the conventional real-letterform counterpart of italic in Chinese
+typesetting, so the embedded italic face is FandolKai (GPL v3 with the GPL font exception). Disable
+`embedded-italic-font` to fall back to system Kaiti faces (FandolKai, Kaiti SC, STKaiti, KaiTi, AR PL KaitiM GB/UKai,
+LXGW WenKai) or synthetic slant when none is installed. bold+italic with an italic face uses the italic face plus a
+synthetic bold stroke. `--italic-font` / `[typeset].italic_font` override the choice with any CJK font file.
+
+Glyphs missing from a style's face are borrowed per character from another face (style face, then regular, bold,
+italic), and a small embedded DejaVu Serif symbol face covers math brackets and shapes absent from every CJK face.
+A paragraph is preserved in the original only when no face carries the glyph.
 
 To use system fonts and get a smaller binary, disable the default `embedded-fonts` feature:
 
@@ -95,9 +105,15 @@ cargo build --release --no-default-features
 In that configuration, `fontdb` reads the platform font database (fontconfig on Linux, system font directories on
 Windows/macOS), prefers the configured generic serif/sans faces, then common CJK families, and only accepts a candidate
 that actually contains Chinese glyphs. A sibling bold face (for example `*-Bold.ttc`) is used for bold when available.
+For italic, a sibling `*-Italic.ttc` is tried first, then Kaiti families (FandolKai, Kaiti SC, STKaiti, KaiTi,
+AR PL KaitiM GB/UKai, LXGW WenKai).
 
-In every configuration, `[typeset].font` / `[typeset].bold_font` or `--font` / `--bold-font` override the defaults.
-Fonts are licensed under the SIL Open Font License 1.1; see [`assets/fonts/LICENSE`](assets/fonts/LICENSE).
+In every configuration, `[typeset].font` / `[typeset].bold_font` / `[typeset].italic_font` or `--font` / `--bold-font` /
+`--italic-font` override the defaults.
+The Noto faces are licensed under the SIL Open Font License 1.1 ([`assets/fonts/LICENSE`](assets/fonts/LICENSE));
+FandolKai under GPL v3 with the GPL font exception ([`assets/fonts/LICENSE-Fandol`](assets/fonts/LICENSE-Fandol));
+DejaVu Serif under the Bitstream Vera / DejaVu license ([`assets/fonts/LICENSE-DejaVu`](assets/fonts/LICENSE-DejaVu)).
+System fonts keep their own licenses.
 
 ## Quick start
 
@@ -119,6 +135,7 @@ concurrency = 6
 [typeset]
 # font = "/path/to/NotoSerifCJK-Regular.ttc"
 # bold_font = "/path/to/NotoSerifCJK-Bold.ttc"
+# italic_font = "/path/to/LXGWWenKai-Regular.ttf"
 min_scale = 0.72
 max_expand = 1.45
 line_height = 1.22
@@ -208,14 +225,14 @@ pdf-translate gui [input.pdf]  # requires the `gui` feature
 | `--overlay`              | Overlay mode; default is clean                        |
 | `--bilingual`            | Write a side-by-side bilingual PDF (original left, translation right) |
 | `--no-cover`             | Overlay mode: do not paint background patches         |
-| `--keep-annotations`     | Keep link/annotation rectangles on translated pages   |
+| `--keep-annotations`     | Keep link annotations at their original rectangles (default: move them with the translation) |
 | `--translate-references` | Translate the reference list too (skipped by default) |
 | `--dump-layout PATH`     | Write layout and translations as JSON                 |
 | `--fake`                 | No network; prefix every paragraph with `[译]`        |
 | `--debug-boxes`          | Draw paragraph bounding boxes                         |
 
 The following options override config defaults: `--target-lang`, `--concurrency`, `--font`, `--bold-font`,
-`--min-scale`, `--max-expand`, `--line-height`, `--api-base`, `--api-key`, `--model`.
+`--italic-font`, `--min-scale`, `--max-expand`, `--line-height`, `--api-base`, `--api-key`, `--model`.
 
 Input, output PDF and layout JSON must be different files. A real-model cache key includes the endpoint, model, target
 language and source text; entries from versions that could not detect truncation are re-requested.
@@ -235,8 +252,9 @@ The default is `clean`:
 retains the covered source text underneath, so it is the fallback for scans and for pages where clean rewriting is not
 possible. `--no-cover` disables the patches.
 
-By default, link annotations are removed from translated pages so that link rectangles do not remain on top of the
-translation; forms, comments, redactions and other annotations are kept. Use `--keep-annotations` to keep links too.
+By default, link rectangles that cover translated text are moved to the translated positions (mapped proportionally
+within each paragraph); links over untranslated content stay in place. Forms, comments, redactions and other
+annotations are always kept. Use `--keep-annotations` to keep link rectangles at their original positions instead.
 
 Neither mode is a general redaction tool for metadata, attachments, annotations or every PDF channel.
 
@@ -261,21 +279,23 @@ Implemented:
   if the model drops a placeholder;
 - footnotes and URLs kept as original vector text; inline URLs use the same `<fN>` mechanism;
 - reference lists skipped by default and translated on request (`--translate-references`);
-- bold/italic detection from PDF font names, passed to the model as `<b>` / `<i>` tags; paragraph-level style fallback
-  if the tags are lost;
+- bold/italic detection from PDF font names and per-span color preservation through `<b>` / `<i>` / `<cRRGGBBAA>` tags;
+  invalid style spans trigger retries and bounded fragment translation;
 - concurrent paragraph translation, truncation retry and a cross-process disk cache;
-- bold/italic preservation (real CJK bold when enabled or available, synthetic italic);
+- bold/italic preservation (real CJK bold when enabled or available; embedded FandolKai italic face by default,
+  system Kaiti fallback; synthetic stroke/slant when no face is available);
 - CJK font subset embedding, ToUnicode, CJK line breaking, punctuation rules and basic justification;
 - clean composition by glyph, per-invocation rewriting of shared Form XObjects, and preservation of mixed text
   positions;
 - side-by-side bilingual output (`--bilingual`) with original and translated pages as Form XObjects;
+- link rectangles remapped onto the translated text (`--keep-annotations` keeps the originals);
 - overlay composition with isolated transforms, clipping and text state;
 - `/ActualText` extraction; fully clipped, transparent or invisible text ignored; partially clipped or soft-masked text
   kept as original;
 - rotated pages (`/Rotate` 0/90/180/270) and non-zero CropBox origins;
 - dynamic font/formula resource names; distinct Unicode mappings for the same glyph; font metrics written in PDF units;
-- warnings and original-text fallback when a glyph is missing or the translation still overflows at the minimum size; no
-  output when nothing can be typeset safely;
+- warnings and original-text fallback when a glyph is missing from every face or the translation still overflows at the
+  minimum size; no output when nothing can be typeset safely;
 - preflight limits on input size and decompressed non-image streams (defaults: 512 MiB input, 64 MiB per stream,
   256 MiB aggregate). Image streams are decoded by the renderer on demand and are neither pre-decompressed nor
   size-capped. These are not a complete sandbox for hostile PDFs.
@@ -285,10 +305,8 @@ Not implemented yet:
 - local HTTP server and paragraph-level Zotero overlays;
 - OCR for scanned PDFs (overlay mode can preserve the scan, but does not recognize text);
 - table text translation (table regions are protected);
-- moving link rectangles with the translated text;
 - translating labels inside figures and tables;
 - text selection for inline formula paths;
-- real italics for CJK (synthetic slant only);
 - decryption of password-protected PDFs, vertical text, complex-script shaping and arbitrarily rotated text;
 - PDF/A, PDF/X, PDF/UA or full PDF 2.0 conformance; existing structure trees, bookmarks and forms are not re-typeset
   with the translation;
@@ -314,14 +332,18 @@ src/
   cli.rs         clap arguments
   config.rs      global TOML config
   workflow.rs    shared translation requests, progress and cancellation
-  gui.rs         optional native desktop interface
+  gui.rs         native desktop entry point and component coordination
   gui/
-    preview.rs   hayro page rendering for the GUI
+    form.rs      document, translation, composition and typesetting controls
+    settings.rs  API settings, themes and configuration persistence
+    job.rs       translation worker, progress, cancellation and logs
+    preview.rs   preview queue, page navigation and hayro rendering
+    widgets.rs   shared form widgets and value conversion helpers
   model.rs       page/line/paragraph/glyph model
   markup.rs      formula placeholders, literal text and style tags
   output.rs      output identity checks and atomic writes
   pages.rs       page-range parsing
-  pdf.rs         PDF module entry
+  pdf.rs         PDF module entry and inline regression tests
   pdf/
     extract.rs   hayro Device: glyphs, images, colors
     content.rs   page content streams and resources
@@ -331,7 +353,6 @@ src/
     rewrite.rs   glyph-level deletion, Form isolation, formula paths, cleanup
     rewrite/     content-stream instrumentation and source-glyph matching
     writer.rs    page composition (clean/overlay)
-    regression.rs composition/font/clip regression tests
   layout.rs      layout analysis entry
   layout/        line clustering, columns, paragraph roles, inline formulas/styles
   translate.rs   translation scheduling and result application
@@ -374,5 +395,5 @@ service and per-paragraph overlays are still future work.
 MIT. See [LICENSE](LICENSE).
 
 Third-party components: hayro (Apache-2.0/MIT), lopdf (MIT), subsetter and pdf-writer (MIT/Apache-2.0), Noto CJK fonts
-(OFL-1.1). The design document discusses optional integrations with BabelDOC (AGPL-3.0) and DocLayout-YOLO (AGPL-3.0);
+(OFL-1.1), FandolKai (GPL v3 with font exception), DejaVu Serif (Bitstream Vera / DejaVu license). The design document discusses optional integrations with BabelDOC (AGPL-3.0) and DocLayout-YOLO (AGPL-3.0);
 they are not part of the current build. Re-evaluate AGPL obligations before porting their code or shipping their models.

@@ -14,9 +14,9 @@ pub(super) fn attach_inline_formulas(paragraph: &mut Paragraph, lines: &[TextLin
             prompt_line(line, base, &paragraph.text, &mut next_id, &mut formulas)
         });
     }
-    let has_style = prompt_lines
-        .iter()
-        .any(|line| line.contains("<i>") || line.contains("<b>"));
+    let has_style = prompt_lines.iter().any(|line| {
+        crate::markup::pieces(line).any(|piece| !matches!(piece, crate::markup::Piece::Text(_)))
+    });
     if formulas.is_empty() && !has_style {
         let escaped = escape_literal(&paragraph.text);
         paragraph.prompt_text = (escaped != paragraph.text).then_some(escaped);
@@ -117,7 +117,7 @@ fn prompt_line(
             prompt.push(' ');
         }
         if let Some(group) = group {
-            prompt.push_str(style_close(style));
+            prompt.push_str(&style_close(style));
             style = TextStyle::default();
             let id = loop {
                 let id = format!("f{}", *next_id);
@@ -155,10 +155,11 @@ fn prompt_line(
                     && (style.italic
                         || after_formula
                         || glyph.text.chars().any(char::is_alphanumeric)),
+                color: (glyph.color != base.color.unwrap_or([0, 0, 0, 255])).then_some(glyph.color),
             };
             if next != style {
-                prompt.push_str(style_close(style));
-                prompt.push_str(style_open(next));
+                prompt.push_str(&style_close(style));
+                prompt.push_str(&style_open(next));
                 style = next;
             }
             prompt.push_str(&escape_literal(&glyph.text));
@@ -167,7 +168,7 @@ fn prompt_line(
             i += 1;
         }
     }
-    prompt.push_str(style_close(style));
+    prompt.push_str(&style_close(style));
     collapse_whitespace(&prompt)
 }
 
@@ -361,7 +362,8 @@ pub(super) fn find_formula_groups(
     let line_size = line.font_size.max(6.0);
     let mut index = usize::from(bullet);
     while index < glyphs.len() {
-        let named_end = math_call_end(glyphs, index, line_size);
+        let named_end = math_call_end(glyphs, index, line_size)
+            .or_else(|| delimited_math_end(glyphs, index, line_size));
         if !is_formula_start(glyphs, index, body_font, line_size) && named_end.is_none() {
             index += 1;
             continue;
@@ -376,6 +378,9 @@ pub(super) fn find_formula_groups(
         {
             start -= 1;
         }
+        // Validate a complete short argument before applying word heuristics.
+        // In Palatino, e.g. ⟨v, T_z v⟩, the operands share a prose italic face
+        // and can otherwise be mistaken for a word after the comma.
         let mut end = named_end.unwrap_or(index);
         while end + 1 < glyphs.len() {
             if is_prose_article(glyphs, end + 1, line_size) {
@@ -385,8 +390,11 @@ pub(super) fn find_formula_groups(
                 .iter()
                 .flat_map(|g| g.text.chars())
                 .map(|ch| {
-                    i32::from(matches!(ch, '(' | '[' | '{'))
-                        - i32::from(matches!(ch, ')' | ']' | '}'))
+                    i32::from(math_closing_delimiter(ch).is_some())
+                        - i32::from(
+                            unicode_math_class::class(ch)
+                                == Some(unicode_math_class::MathClass::Closing),
+                        )
                 })
                 .sum();
             let roman_argument = argument_depth > 0
@@ -399,6 +407,7 @@ pub(super) fn find_formula_groups(
             if glyph_gap(glyphs[end], glyphs[end + 1]) <= line_size * 0.5
                 && !(argument_depth == 0 && glyphs[end].text.chars().all(is_math_punctuation))
                 && let Some(operator_end) = math_call_end(glyphs, end + 1, line_size)
+                    .or_else(|| delimited_math_end(glyphs, end + 1, line_size))
             {
                 end = operator_end;
             } else if (roman_argument
@@ -425,13 +434,14 @@ pub(super) fn find_formula_groups(
         // closing mate. Leaving only '(' in the prompt makes models add a
         // second ')' without knowing one is inside the protected object.
         while start > 0 && glyph_gap(glyphs[start - 1], glyphs[start]) < line_size * 0.5 {
-            let close = match glyphs[start - 1].text.as_str() {
-                "(" => ')',
-                "[" => ']',
-                "{" => '}',
-                _ => break,
+            let mut chars = glyphs[start - 1].text.chars();
+            let Some(open) = chars.next() else { break };
+            let Some(close) = math_closing_delimiter(open) else {
+                break;
             };
-            let open = glyphs[start - 1].text.chars().next().unwrap();
+            if chars.next().is_some() {
+                break;
+            }
             let balance: i32 = glyphs[start..=end]
                 .iter()
                 .flat_map(|g| g.text.chars())
@@ -487,6 +497,7 @@ fn is_formula_start(glyphs: &[&GlyphBox], index: usize, body_font: &str, line_si
         && index > 0
         && !is_math_glyph(glyphs[index - 1])
         && glyphs[index - 1].text.chars().all(|ch| ch.is_alphabetic())
+        && !is_script_pair(glyphs[index - 1], glyph)
         && glyph_gap(glyphs[index - 1], glyph) < line_size * 0.1
     {
         return false;
@@ -494,7 +505,12 @@ fn is_formula_start(glyphs: &[&GlyphBox], index: usize, body_font: &str, line_si
     if is_prose_article(glyphs, index, line_size) {
         return false;
     }
-    math_font || (nonbody && (single_letter || is_math_token(&glyph.text) || script))
+    math_font
+        || (nonbody && (single_letter || is_math_token(&glyph.text) || script))
+        || (single_letter
+            && glyphs.get(index + 1).is_some_and(|next| {
+                next.font_size < glyph.font_size && is_script_pair(glyph, next)
+            }))
 }
 
 fn is_prose_article(glyphs: &[&GlyphBox], index: usize, line_size: f64) -> bool {
@@ -507,6 +523,7 @@ fn is_prose_article(glyphs: &[&GlyphBox], index: usize, line_size: f64) -> bool 
             // in "x (a positive literal)". Do not bind it to the preceding x.
             next.iter().all(|g| {
                 !is_math_glyph(g)
+                    && (!glyph.italic || g.italic)
                     && g.text.chars().all(|ch| ch.is_alphabetic())
                     && (g.font_size - glyph.font_size).abs() < line_size * 0.1
             }) && glyph_gap(glyph, next[0]) < line_size * 0.6
@@ -527,6 +544,9 @@ fn can_extend_formula(
         return false;
     };
     if next.math_group || is_math_font(Some(font)) || next.font_size < line_size * 0.8 {
+        return true;
+    }
+    if is_script_pair(current, next) {
         return true;
     }
     if font != body_font
@@ -568,6 +588,86 @@ fn glyph_gap(left: &GlyphBox, right: &GlyphBox) -> f64 {
     (right.origin_x - (left.origin_x + advance)).max(0.0)
 }
 
+fn is_script_pair(first: &GlyphBox, second: &GlyphBox) -> bool {
+    let (base, script) = if first.font_size >= second.font_size {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let shift = (base.origin_y - script.origin_y).abs();
+    let (left, right) = if first.origin_x <= second.origin_x {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    // A size change alone also occurs in small caps. A true script is smaller,
+    // displaced from the base's baseline and tightly attached horizontally.
+    script.font_size < base.font_size * 0.8
+        && shift >= base.font_size * 0.1
+        && shift <= base.font_size * 0.85
+        && glyph_gap(left, right) < base.font_size * 0.22
+        && [base, script]
+            .iter()
+            .all(|glyph| !glyph.text.is_empty() && glyph.text.chars().all(char::is_alphanumeric))
+}
+
+/// Recognize equation fragments without counting scripted labels or the
+/// arguments of a mathematical call as ordinary prose words.
+pub(super) fn is_math_only(line: &TextLine) -> bool {
+    let glyphs: Vec<_> = line
+        .glyphs
+        .iter()
+        .filter(|g| !g.text.trim().is_empty())
+        .collect();
+    let mut prose = String::new();
+    let mut evidence = false;
+    let mut index = 0;
+    while index < glyphs.len() {
+        let glyph = glyphs[index];
+        if let Some(end) = math_call_end(&glyphs, index, line.font_size)
+            .or_else(|| delimited_math_end(&glyphs, index, line.font_size))
+        {
+            evidence = true;
+            prose.push(' ');
+            index = end + 1;
+            continue;
+        }
+        if index > 0
+            && glyph.font_size < glyphs[index - 1].font_size
+            && is_script_pair(glyphs[index - 1], glyph)
+        {
+            evidence = true;
+            let first = glyph;
+            index += 1;
+            while index < glyphs.len()
+                && (glyphs[index].font_size - first.font_size).abs() < first.font_size * 0.1
+                && (glyphs[index].origin_y - first.origin_y).abs() < first.font_size * 0.2
+                && glyph_gap(glyphs[index - 1], glyphs[index]) < first.font_size * 0.22
+                && glyphs[index].text.chars().all(char::is_alphanumeric)
+            {
+                index += 1;
+            }
+            prose.push(' ');
+            continue;
+        }
+        if is_math_glyph(glyph) {
+            evidence = true;
+            prose.push(' ');
+        } else {
+            evidence |= glyph.text.chars().any(is_math_operator);
+            if index > 0 && glyph_gap(glyphs[index - 1], glyph) > line.font_size * 0.12 {
+                prose.push(' ');
+            }
+            prose.push_str(&glyph.text);
+        }
+        index += 1;
+    }
+    evidence
+        && prose
+            .split(|ch: char| !ch.is_alphabetic())
+            .all(|word| word.chars().count() <= 1 || is_named_math_operator(word))
+}
+
 fn is_math_token(text: &str) -> bool {
     !text.is_empty()
         && text.chars().all(|ch| {
@@ -600,6 +700,7 @@ fn is_single_letter_inside_word(
     let body_letter = |glyph: &GlyphBox| {
         (glyph.font_name.as_deref() == Some(body_font) || !is_math_glyph(glyph))
             && glyph.text.chars().all(|ch| ch.is_alphabetic())
+            && !is_script_pair(glyphs[start], glyph)
     };
     (start > 0 && body_letter(glyphs[start - 1]) && small_gap(glyphs[start - 1], glyphs[start]))
         // Possessives and contractions can switch fonts after an apostrophe.
@@ -651,7 +752,12 @@ fn is_valid_formula_text(glyphs: &[&GlyphBox], text: &str) -> bool {
     if !has_letter && !has_operator {
         return false;
     }
-    if has_math_font || has_operator {
+    if has_math_font
+        || has_operator
+        || glyphs
+            .windows(2)
+            .any(|pair| is_script_pair(pair[0], pair[1]))
+    {
         return true;
     }
     text.chars().count() == 1 && text.chars().next().is_some_and(|ch| ch.is_alphabetic())
@@ -784,11 +890,38 @@ fn math_call_end(glyphs: &[&GlyphBox], start: usize, line_size: f64) -> Option<u
     if name.is_empty()
         || (name.len() > 1 && !name.chars().all(|ch| ch.is_ascii_uppercase()))
         || glyphs.get(end)?.text != "("
-        || glyph_gap(glyphs[end - 1], glyphs[end]) > line_size * 0.12
+        || glyph_gap(glyphs[end - 1], glyphs[end])
+            > line_size
+                * if is_math_glyph(glyphs[end - 1]) {
+                    0.3
+                } else {
+                    0.12
+                }
     {
         return None;
     }
-    math_argument_end(glyphs, end, line_size, 3)
+    math_argument_end(glyphs, end, line_size, 16)
+}
+
+fn delimited_math_end(glyphs: &[&GlyphBox], open: usize, line_size: f64) -> Option<usize> {
+    let end = math_argument_end(glyphs, open, line_size, 3)?;
+    // Short prose such as "x (see)" or "x [sic]" also has balanced brackets.
+    // Unlike a named function call, a bare group needs its own math evidence.
+    let text: String = glyphs[open + 1..end]
+        .iter()
+        .map(|g| g.text.as_str())
+        .collect();
+    let variable_list = text.contains(',')
+        && text.chars().any(char::is_alphabetic)
+        && text.split(',').all(|part| {
+            let part = part.trim();
+            part.chars().count() == 1 && part.chars().all(char::is_alphanumeric)
+        });
+    (variable_list
+        || glyphs[open..=end]
+            .iter()
+            .any(|glyph| is_math_glyph(glyph) || glyph.font_size < line_size * 0.8))
+    .then_some(end)
 }
 
 fn math_argument_end(
@@ -797,9 +930,13 @@ fn math_argument_end(
     line_size: f64,
     max_letters: usize,
 ) -> Option<usize> {
-    let mut depth = 1;
+    let mut opening = glyphs.get(open)?.text.chars();
+    let mut closing = vec![math_closing_delimiter(opening.next()?)?];
+    if opening.next().is_some() {
+        return None;
+    }
     let mut letters = 0;
-    for i in open + 1..glyphs.len().min(open + 32) {
+    for i in open + 1..glyphs.len().min(open + 128) {
         if glyph_gap(glyphs[i - 1], glyphs[i]) > line_size * 0.5 {
             return None;
         }
@@ -815,6 +952,9 @@ fn math_argument_end(
             return None;
         }
         for ch in glyphs[i].text.chars() {
+            if closing.is_empty() {
+                return None;
+            }
             letters = if ch.is_ascii_alphabetic() {
                 letters + 1
             } else {
@@ -823,20 +963,39 @@ fn math_argument_end(
             if letters > max_letters {
                 return None;
             }
-            match ch {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ch if ch.is_ascii_alphanumeric()
-                    || is_math_char(ch)
-                    || is_math_token(&ch.to_string()) => {}
-                _ => return None,
+            if let Some(close) = math_closing_delimiter(ch) {
+                closing.push(close);
+            } else if unicode_math_class::class(ch) == Some(unicode_math_class::MathClass::Closing)
+            {
+                if closing.pop() != Some(ch) {
+                    return None;
+                }
+            } else if !(ch.is_ascii_alphanumeric()
+                || is_math_char(ch)
+                || is_math_token(&ch.to_string()))
+            {
+                return None;
             }
         }
-        if depth == 0 {
+        if closing.is_empty() {
             return (i > open + 1).then_some(i);
         }
     }
     None
+}
+
+fn math_closing_delimiter(open: char) -> Option<char> {
+    Some(match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '⟨' => '⟩',
+        '⟪' => '⟫',
+        '⟦' => '⟧',
+        '⌈' => '⌉',
+        '⌊' => '⌋',
+        _ => return None,
+    })
 }
 
 fn is_math_font(name: Option<&str>) -> bool {

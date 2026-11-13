@@ -102,6 +102,12 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub bold_font: Option<PathBuf>,
 
+    /// Optional italic CJK font (a Kaiti face works well for Chinese).
+    /// Overrides [typeset].italic_font. Without an italic face, italic text
+    /// uses synthetic slant.
+    #[arg(long)]
+    pub italic_font: Option<PathBuf>,
+
     /// Smallest font scale allowed when fitting translations.
     /// Overrides [typeset].min_scale (default: 0.72).
     #[arg(long)]
@@ -127,7 +133,8 @@ pub struct TranslateArgs {
     #[arg(long)]
     pub bilingual: bool,
 
-    /// Keep link/annotation rectangles on translated pages.
+    /// Keep link annotations at their original rectangles instead of moving
+    /// them with the translated text.
     #[arg(long)]
     pub keep_annotations: bool,
 

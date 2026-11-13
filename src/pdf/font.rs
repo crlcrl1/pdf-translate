@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(not(feature = "embedded-fonts"))]
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -59,6 +58,18 @@ mod embedded_fonts {
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/NotoSerifCJKsc-Bold.otf.zst"
     ));
+    #[cfg(feature = "embedded-italic-font")]
+    pub const ITALIC_NAME: &str = "FandolKai Regular";
+    #[cfg(feature = "embedded-italic-font")]
+    pub const ITALIC: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/FandolKai-Regular.otf.zst"
+    ));
+    pub const SYMBOL_NAME: &str = "DejaVu Serif";
+    pub const SYMBOL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/DejaVuSerif.ttf.zst"
+    ));
 }
 
 #[cfg(feature = "embedded-fonts")]
@@ -77,6 +88,33 @@ fn embedded_bold_font() -> Result<FontSource> {
         bail!("embedded bold font has no CJK glyphs");
     }
     Ok(font)
+}
+
+#[cfg(feature = "embedded-italic-font")]
+fn embedded_italic_font() -> Result<FontSource> {
+    let font = FontSource::from_embedded(embedded_fonts::ITALIC_NAME, embedded_fonts::ITALIC, 0)?;
+    if !font.supports_cjk() {
+        bail!("embedded italic font has no CJK glyphs");
+    }
+    Ok(font)
+}
+
+#[cfg(feature = "embedded-fonts")]
+fn embedded_symbol_font() -> Result<FontSource> {
+    FontSource::from_embedded(embedded_fonts::SYMBOL_NAME, embedded_fonts::SYMBOL, 0)
+}
+
+/// Last-resort face for glyphs absent from every CJK face (math brackets,
+/// geometric shapes, ...). Not CJK-gated: it only serves non-CJK symbols.
+pub fn find_default_symbol_font() -> Option<FontSource> {
+    #[cfg(feature = "embedded-fonts")]
+    {
+        embedded_symbol_font().ok()
+    }
+    #[cfg(not(feature = "embedded-fonts"))]
+    {
+        None
+    }
 }
 
 impl FontSource {
@@ -278,15 +316,18 @@ impl FontMetrics {
         }
     }
 
+    pub fn ascent_ratio(&self) -> f64 {
+        (self.ascender / self.units_per_em).clamp(0.6, 1.0)
+    }
+}
+
+#[cfg(test)]
+impl FontMetrics {
     pub fn text_width(&self, text: &str, size: f64, letter_spacing: f64) -> f64 {
         text.chars()
             .map(|ch| self.char_advance(ch, size))
             .sum::<f64>()
             + text.chars().count().saturating_sub(1) as f64 * letter_spacing
-    }
-
-    pub fn ascent_ratio(&self) -> f64 {
-        (self.ascender / self.units_per_em).clamp(0.6, 1.0)
     }
 }
 
@@ -428,7 +469,6 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-#[cfg(not(feature = "embedded-fonts"))]
 fn system_font_database() -> &'static fontdb::Database {
     static DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
     DATABASE.get_or_init(|| {
@@ -438,7 +478,6 @@ fn system_font_database() -> &'static fontdb::Database {
     })
 }
 
-#[cfg(not(feature = "embedded-fonts"))]
 fn system_face_source(face: &fontdb::FaceInfo) -> Option<(PathBuf, u32)> {
     let path = match &face.source {
         fontdb::Source::File(path) => path.clone(),
@@ -549,6 +588,72 @@ pub fn find_default_bold_font(explicit: Option<&Path>, regular: &FontSource) -> 
     None
 }
 
+pub fn find_default_italic_font(
+    explicit: Option<&Path>,
+    regular: &FontSource,
+) -> Option<FontSource> {
+    if let Some(path) = explicit {
+        return FontSource::load(path, None).ok();
+    }
+
+    #[cfg(feature = "embedded-italic-font")]
+    if regular.embedded {
+        return embedded_italic_font().ok();
+    }
+
+    let path = regular.path.to_string_lossy();
+    for marker in ["Regular", "Regu", "regular"] {
+        if path.contains(marker) {
+            let candidate = path.replace(marker, "Italic");
+            if candidate != path && Path::new(&candidate).exists() {
+                return FontSource::load(candidate, None).ok();
+            }
+        }
+    }
+
+    find_system_kaiti_font()
+}
+
+// Kaiti is the conventional real-letterform italic counterpart for CJK.
+// The embedded face is FandolKai (GPL + font exception); system fallbacks
+// are other locally installed Kaiti families.
+fn find_system_kaiti_font() -> Option<FontSource> {
+    const FAMILIES: [fontdb::Family<'static>; 8] = [
+        fontdb::Family::Name("FandolKai"),
+        fontdb::Family::Name("Kaiti SC"),
+        fontdb::Family::Name("STKaiti"),
+        fontdb::Family::Name("KaiTi"),
+        fontdb::Family::Name("AR PL KaitiM GB"),
+        fontdb::Family::Name("AR PL UKai CN"),
+        fontdb::Family::Name("LXGW WenKai"),
+        fontdb::Family::Name("霞鹜文楷"),
+    ];
+    let database = system_font_database();
+    for family in FAMILIES {
+        let query = fontdb::Query {
+            families: &[family],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        };
+        let Some(id) = database.query(&query) else {
+            continue;
+        };
+        let Some(face) = database.face(id) else {
+            continue;
+        };
+        let Some((path, index)) = system_face_source(face) else {
+            continue;
+        };
+        if let Ok(font) = FontSource::load(&path, Some(index))
+            && font.supports_cjk()
+        {
+            return Some(font);
+        }
+    }
+    None
+}
+
 #[cfg(all(test, feature = "embedded-fonts"))]
 mod tests {
     use super::*;
@@ -581,5 +686,47 @@ mod tests {
                 .char_to_gid
                 .contains_key(&'中')
         );
+    }
+
+    #[cfg(feature = "embedded-italic-font")]
+    #[test]
+    fn embedded_italic_font_is_available() {
+        let regular = find_default_font(None).unwrap();
+        let italic = find_default_italic_font(None, &regular).unwrap();
+        assert!(italic.embedded);
+        assert!(italic.family.contains("FandolKai"));
+        assert!(italic.supports_cjk());
+        assert!(
+            italic
+                .metrics(['中', '文'])
+                .unwrap()
+                .char_to_gid
+                .contains_key(&'中')
+        );
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_italic_font_overrides_discovery() {
+        let regular = FontSource::load("tests/fixtures/test.ttf", None).unwrap();
+        let italic =
+            find_default_italic_font(Some(Path::new("tests/fixtures/test.otf")), &regular).unwrap();
+        assert!(italic.path.ends_with("test.otf"));
+    }
+
+    #[test]
+    fn sibling_italic_face_is_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular_path = dir.path().join("Regular.ttf");
+        let italic_path = dir.path().join("Italic.ttf");
+        std::fs::copy("tests/fixtures/test.ttf", &regular_path).unwrap();
+        std::fs::copy("tests/fixtures/test.ttf", &italic_path).unwrap();
+        let regular = FontSource::load(&regular_path, None).unwrap();
+        let italic = find_default_italic_font(None, &regular).unwrap();
+        assert_eq!(italic.path, italic_path);
     }
 }

@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use hayro::kurbo::Affine;
+use hayro::kurbo::{Affine, Point};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::model::{BBox, PageLayout, Paragraph};
@@ -13,10 +13,14 @@ use crate::typeset::{TypesetDocument, TypesetLine, TypesetParagraph, TypesetSegm
 
 pub const FONT_RESOURCE_NAME: &str = "Fpdfzh";
 pub const BOLD_FONT_RESOURCE_NAME: &str = "FpdfzhB";
+pub const ITALIC_FONT_RESOURCE_NAME: &str = "FpdfzhI";
+pub const SYMBOL_FONT_RESOURCE_NAME: &str = "FpdfzhS";
 
 struct ResourceNames {
     regular: Vec<String>,
     bold: Vec<String>,
+    italic: Vec<String>,
+    symbol: Vec<String>,
     formulas: HashMap<String, HashMap<String, String>>,
 }
 
@@ -26,6 +30,8 @@ impl ResourceNames {
         page_id: ObjectId,
         regular_count: usize,
         bold_count: usize,
+        italic_count: usize,
+        symbol_count: usize,
     ) -> Result<Self> {
         let resources = page_resources_clone(document, page_id)?;
         let unique = |category: &[u8], base: &str| -> String {
@@ -51,6 +57,12 @@ impl ResourceNames {
                 .collect(),
             bold: (0..bold_count)
                 .map(|i| unique(b"Font", &format!("{BOLD_FONT_RESOURCE_NAME}U{i}")))
+                .collect(),
+            italic: (0..italic_count)
+                .map(|i| unique(b"Font", &format!("{ITALIC_FONT_RESOURCE_NAME}U{i}")))
+                .collect(),
+            symbol: (0..symbol_count)
+                .map(|i| unique(b"Font", &format!("{SYMBOL_FONT_RESOURCE_NAME}U{i}")))
                 .collect(),
             formulas: Default::default(),
         })
@@ -104,6 +116,8 @@ pub fn write_translated_pdf(
 ) -> Result<()> {
     let font = &typeset.font;
     let bold_font = typeset.bold_font.as_ref();
+    let italic_font = typeset.italic_font.as_ref();
+    let symbol_font = typeset.symbol_font.as_ref();
     if document.objects.values().any(|object| {
         object
             .as_dict()
@@ -123,9 +137,17 @@ pub fn write_translated_pdf(
         ComposeMode::Clean => super::rewrite::remove_translated(&mut document, pages, typeset)?,
         ComposeMode::Overlay => super::rewrite::outline_formulas(&mut document, pages, typeset)?,
     };
-    let font_ids = add_embedded_font(&mut document, font)?;
+    let font_ids = add_embedded_font(&mut document, font, false)?;
     let bold_font_ids = match bold_font {
-        Some(bold) => add_embedded_font(&mut document, bold)?,
+        Some(bold) => add_embedded_font(&mut document, bold, false)?,
+        None => Vec::new(),
+    };
+    let italic_font_ids = match italic_font {
+        Some(italic) => add_embedded_font(&mut document, italic, true)?,
+        None => Vec::new(),
+    };
+    let symbol_font_ids = match symbol_font {
+        Some(symbol) => add_embedded_font(&mut document, symbol, false)?,
         None => Vec::new(),
     };
     let page_ids = document.get_pages();
@@ -139,11 +161,25 @@ pub fn write_translated_pdf(
             continue;
         }
 
-        let mut names =
-            ResourceNames::for_page(&document, page_id, font_ids.len(), bold_font_ids.len())?;
-        install_fonts(&mut document, page_id, &names, &font_ids, &bold_font_ids)?;
+        let mut names = ResourceNames::for_page(
+            &document,
+            page_id,
+            font_ids.len(),
+            bold_font_ids.len(),
+            italic_font_ids.len(),
+            symbol_font_ids.len(),
+        )?;
+        install_fonts(
+            &mut document,
+            page_id,
+            &names,
+            &font_ids,
+            &bold_font_ids,
+            &italic_font_ids,
+            &symbol_font_ids,
+        )?;
         if !options.keep_annotations {
-            remove_link_annotations(&mut document, page_id)?;
+            remap_link_annotations(&mut document, page_id, page, &translated)?;
         }
 
         if let Some(rewritten) = rewritten.get(&page.index) {
@@ -172,7 +208,14 @@ pub fn write_translated_pdf(
                     .insert(formula.id.clone(), name);
             }
         }
-        let content = build_translation_ops(page, &translated, font, bold_font, &names, options)?;
+        let fonts = TranslationFonts {
+            font,
+            bold_font,
+            italic_font,
+            symbol_font,
+            names: &names,
+        };
+        let content = build_translation_ops(page, &translated, &fonts, options)?;
         append_page_content(&mut document, page_id, content.into_bytes())?;
     }
     // Saving a rewritten page alone leaves detached source streams in lopdf's
@@ -182,10 +225,16 @@ pub fn write_translated_pdf(
     crate::output::atomic_write(output, |file| Ok(document.save_to(file)?))
 }
 
-/// Remove only link annotations. Other annotations (form widgets, comments,
-/// redaction marks, signatures, ...) are preserved because deleting them can
-/// lose data or expose content that was intentionally covered.
-fn remove_link_annotations(document: &mut Document, page_id: ObjectId) -> Result<()> {
+/// Move link rectangles onto the translated text. Links that do not overlap
+/// any translated paragraph keep their original position; other annotation
+/// types (form widgets, comments, redaction marks, signatures, ...) are
+/// preserved because deleting them can lose data or expose covered content.
+fn remap_link_annotations(
+    document: &mut Document,
+    page_id: ObjectId,
+    page: &PageLayout,
+    translated: &[(&Paragraph, &TypesetParagraph)],
+) -> Result<()> {
     let annots = match document.get_object(page_id)?.as_dict()?.get(b"Annots") {
         Ok(annots) => annots.clone(),
         Err(_) => return Ok(()),
@@ -202,23 +251,159 @@ fn remove_link_annotations(document: &mut Document, page_id: ObjectId) -> Result
     let mut kept = Vec::with_capacity(array.len());
     let mut changed = false;
     for annot in array {
-        if is_link_annotation(document, &annot) {
-            changed = true;
-        } else {
+        if !is_link_annotation(document, &annot) {
             kept.push(annot);
+            continue;
         }
+        let (dict, id) = match &annot {
+            Object::Reference(id) => match document.get_dictionary(*id) {
+                Ok(dict) => (dict.clone(), Some(*id)),
+                Err(_) => {
+                    kept.push(annot);
+                    continue;
+                }
+            },
+            Object::Dictionary(dict) => (dict.clone(), None),
+            _ => {
+                kept.push(annot);
+                continue;
+            }
+        };
+        let Some(rect) = dict.get(b"Rect").ok().and_then(object_rect) else {
+            kept.push(annot);
+            continue;
+        };
+        let Some(mapped) = remap_rect(rect, page, translated) else {
+            kept.push(annot);
+            continue;
+        };
+        let values = Object::Array(vec![
+            mapped.x0.into(),
+            mapped.y0.into(),
+            mapped.x1.into(),
+            mapped.y1.into(),
+        ]);
+        match id {
+            Some(id) => {
+                let target = document.get_object_mut(id)?.as_dict_mut()?;
+                target.set("Rect", values);
+                target.remove(b"QuadPoints");
+                kept.push(annot);
+            }
+            None => {
+                let mut dict = dict;
+                dict.set("Rect", values);
+                dict.remove(b"QuadPoints");
+                kept.push(Object::Dictionary(dict));
+            }
+        }
+        changed = true;
     }
     if !changed {
         return Ok(());
     }
-
-    let page = document.get_object_mut(page_id)?.as_dict_mut()?;
-    if kept.is_empty() {
-        page.remove(b"Annots");
-    } else {
-        page.set("Annots", Object::Array(kept));
-    }
+    document
+        .get_object_mut(page_id)?
+        .as_dict_mut()?
+        .set("Annots", Object::Array(kept));
     Ok(())
+}
+
+/// Map a link rectangle from source paragraph geometry into the typeset
+/// translation, proportionally within each overlapping paragraph. Translation
+/// rewraps lines, so there is no line-to-line correspondence; the paragraph
+/// box is the stable anchor shared by both sides.
+fn remap_rect(
+    rect: BBox,
+    page: &PageLayout,
+    translated: &[(&Paragraph, &TypesetParagraph)],
+) -> Option<BBox> {
+    let to_layout = page_matrix(page);
+    let layout_rect = transform_rect(rect, to_layout);
+    let mut mapped: Option<BBox> = None;
+    for (paragraph, typeset) in translated {
+        let source = paragraph.bbox;
+        if !source.intersects(layout_rect) {
+            continue;
+        }
+        let Some(dest) = typeset
+            .lines
+            .iter()
+            .map(|line| line.bbox)
+            .reduce(BBox::union)
+        else {
+            continue;
+        };
+        if source.width() <= 1e-6
+            || source.height() <= 1e-6
+            || dest.width() <= 1e-6
+            || dest.height() <= 1e-6
+        {
+            continue;
+        }
+        let clip = BBox::new(
+            layout_rect.x0.max(source.x0),
+            layout_rect.y0.max(source.y0),
+            layout_rect.x1.min(source.x1),
+            layout_rect.y1.min(source.y1),
+        );
+        let scale_x = dest.width() / source.width();
+        let scale_y = dest.height() / source.height();
+        let piece = BBox::new(
+            dest.x0 + (clip.x0 - source.x0) * scale_x,
+            dest.y0 + (clip.y0 - source.y0) * scale_y,
+            dest.x0 + (clip.x1 - source.x0) * scale_x,
+            dest.y0 + (clip.y1 - source.y0) * scale_y,
+        );
+        mapped = Some(mapped.map_or(piece, |current| current.union(piece)));
+    }
+    let mapped = mapped?;
+    (mapped.width() > 1e-6 && mapped.height() > 1e-6)
+        .then(|| transform_rect(mapped, to_layout.inverse()))
+}
+
+fn transform_rect(rect: BBox, matrix: Affine) -> BBox {
+    let corners = [
+        matrix * Point::new(rect.x0, rect.y0),
+        matrix * Point::new(rect.x1, rect.y0),
+        matrix * Point::new(rect.x0, rect.y1),
+        matrix * Point::new(rect.x1, rect.y1),
+    ];
+    BBox::new(
+        corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min),
+        corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min),
+        corners
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::NEG_INFINITY, f64::max),
+        corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+fn object_rect(object: &Object) -> Option<BBox> {
+    let Object::Array(values) = object else {
+        return None;
+    };
+    if values.len() != 4 {
+        return None;
+    }
+    let mut coords = [0.0; 4];
+    for (slot, value) in coords.iter_mut().zip(values) {
+        *slot = match value {
+            Object::Integer(number) => *number as f64,
+            Object::Real(number) => f64::from(*number),
+            _ => return None,
+        };
+    }
+    Some(BBox::new(
+        coords[0].min(coords[2]),
+        coords[1].min(coords[3]),
+        coords[0].max(coords[2]),
+        coords[1].max(coords[3]),
+    ))
 }
 
 fn is_link_annotation(document: &Document, annot: &Object) -> bool {
@@ -256,7 +441,11 @@ fn translated_paragraphs<'a>(
         .collect()
 }
 
-fn add_embedded_font(document: &mut Document, font: &EmbeddedFont) -> Result<Vec<ObjectId>> {
+fn add_embedded_font(
+    document: &mut Document,
+    font: &EmbeddedFont,
+    italic: bool,
+) -> Result<Vec<ObjectId>> {
     let file_id = if font.is_cff {
         document.add_object(
             Stream::new(
@@ -282,10 +471,11 @@ fn add_embedded_font(document: &mut Document, font: &EmbeddedFont) -> Result<Vec
 
     let bbox = font.metrics.bbox;
     let metric_scale = 1000.0 / font.metrics.units_per_em;
+    let flags = if italic { 4 | 64 } else { 4 };
     let mut descriptor = dictionary! {
             "Type" => "FontDescriptor",
             "FontName" => Object::Name(font.pdf_name.as_bytes().to_vec()),
-            "Flags" => 4,
+            "Flags" => flags,
             "FontBBox" => Object::Array(vec![
                 bbox[0].into(),
                 bbox[1].into(),
@@ -363,12 +553,16 @@ fn install_fonts(
     names: &ResourceNames,
     regular: &[ObjectId],
     bold: &[ObjectId],
+    italic: &[ObjectId],
+    symbol: &[ObjectId],
 ) -> Result<()> {
     for (name, id) in names
         .regular
         .iter()
         .zip(regular)
         .chain(names.bold.iter().zip(bold))
+        .chain(names.italic.iter().zip(italic))
+        .chain(names.symbol.iter().zip(symbol))
     {
         install_resource(document, page_id, "Font", name, *id)?;
     }
@@ -414,35 +608,82 @@ fn append_page_content(document: &mut Document, page_id: ObjectId, content: Vec<
     Ok(())
 }
 
+/// The embedded faces plus their page resource names, bundled so the drawing
+/// helpers stay cohesive and under the argument-count lint.
+struct TranslationFonts<'a> {
+    font: &'a EmbeddedFont,
+    bold_font: Option<&'a EmbeddedFont>,
+    italic_font: Option<&'a EmbeddedFont>,
+    symbol_font: Option<&'a EmbeddedFont>,
+    names: &'a ResourceNames,
+}
+
+/// Pick the face that actually carries a glyph: the style's own face first,
+/// then any borrowed face, with the symbol face as last resort. Mirrors
+/// `typeset::Faces::for_char` so measurement and drawing agree.
+fn run_face<'a>(
+    ch: char,
+    bold: bool,
+    italic: bool,
+    fonts: &'a TranslationFonts<'a>,
+) -> (&'a EmbeddedFont, &'a Vec<String>, bool) {
+    let preferred = if italic {
+        fonts.italic_font
+    } else if bold {
+        fonts.bold_font
+    } else {
+        None
+    };
+    if let Some(face) = preferred.filter(|face| face.char_to_code.contains_key(&ch)) {
+        let resource = if italic {
+            &fonts.names.italic
+        } else {
+            &fonts.names.bold
+        };
+        return (face, resource, !italic);
+    }
+    for (face, resource, is_bold_face) in [
+        (Some(fonts.font), &fonts.names.regular, false),
+        (fonts.bold_font, &fonts.names.bold, true),
+        (fonts.italic_font, &fonts.names.italic, false),
+        (fonts.symbol_font, &fonts.names.symbol, false),
+    ] {
+        if let Some(face) = face.filter(|face| face.char_to_code.contains_key(&ch)) {
+            return (face, resource, is_bold_face);
+        }
+    }
+    (fonts.font, &fonts.names.regular, false)
+}
+
 fn write_text_run(
     out: &mut String,
     segment: &TypesetSegment,
     line: &TypesetLine,
-    font: &EmbeddedFont,
-    bold_font: Option<&EmbeddedFont>,
-    names: &ResourceNames,
+    fonts: &TranslationFonts<'_>,
 ) {
     let TypesetSegment {
         text,
         x,
         bold,
         italic,
+        color,
     } = segment;
     let (bold, italic) = (*bold, *italic);
-    let (size, baseline, color) = (line.size, line.baseline, line.color);
+    let (size, baseline) = (line.size, line.baseline);
     if text.is_empty() {
         return;
     }
-    let use_bold_font = bold && bold_font.is_some();
-    let active_font = bold_font.filter(|_| bold).unwrap_or(font);
-    let [r, g, b, _] = color;
-    let resource = if use_bold_font {
-        &names.bold
-    } else {
-        &names.regular
-    };
+    let [r, g, b, _] = *color;
+    let mut runs: Vec<(&EmbeddedFont, &Vec<String>, bool, String)> = Vec::new();
+    for ch in text.chars() {
+        let (face, resource, is_bold_face) = run_face(ch, bold, italic, fonts);
+        match runs.last_mut() {
+            Some((last_face, _, _, buffer)) if std::ptr::eq(*last_face, face) => buffer.push(ch),
+            _ => runs.push((face, resource, is_bold_face, ch.to_string())),
+        }
+    }
     let _ = writeln!(out, "q");
-    let _ = writeln!(out, "BT\n0 Tr\n0 Tc\n0 Tw\n100 Tz\n0 Ts");
+    let _ = writeln!(out, "BT\n0 Tc\n0 Tw\n100 Tz\n0 Ts");
     let _ = writeln!(
         out,
         "{:.4} {:.4} {:.4} rg",
@@ -450,22 +691,32 @@ fn write_text_run(
         f64::from(g) / 255.0,
         f64::from(b) / 255.0
     );
-    if bold && !use_bold_font {
-        let _ = writeln!(
-            out,
-            "{:.4} {:.4} {:.4} RG",
-            f64::from(r) / 255.0,
-            f64::from(g) / 255.0,
-            f64::from(b) / 255.0
-        );
-        let _ = writeln!(out, "{:.3} w", (size * 0.025).max(0.2));
-        let _ = writeln!(out, "2 Tr");
-    }
-    let skew = if italic { 0.21 } else { 0.0 };
+    // A real italic face (Kaiti) is upright; only synthesize slant when no
+    // italic face exists at all.
+    let skew = if italic && fonts.italic_font.is_none() {
+        0.21
+    } else {
+        0.0
+    };
     let _ = writeln!(out, "1 0 {skew:.4} 1 {x:.3} {baseline:.3} Tm");
-    for (variant, run) in active_font.variant_runs(text) {
-        let encoded = active_font.encode_text(run);
-        let _ = writeln!(out, "/{} {size:.3} Tf\n<{encoded}> Tj", resource[variant]);
+    for (face, resource, is_bold_face, run) in runs {
+        if bold && !is_bold_face {
+            let _ = writeln!(
+                out,
+                "{:.4} {:.4} {:.4} RG",
+                f64::from(r) / 255.0,
+                f64::from(g) / 255.0,
+                f64::from(b) / 255.0
+            );
+            let _ = writeln!(out, "{:.3} w", (size * 0.025).max(0.2));
+            let _ = writeln!(out, "2 Tr");
+        } else {
+            let _ = writeln!(out, "0 Tr");
+        }
+        for (variant, piece) in face.variant_runs(&run) {
+            let encoded = face.encode_text(piece);
+            let _ = writeln!(out, "/{} {size:.3} Tf\n<{encoded}> Tj", resource[variant]);
+        }
     }
     let _ = writeln!(out, "ET");
     let _ = writeln!(out, "Q");
@@ -485,9 +736,7 @@ fn write_fill_rect(out: &mut String, bbox: BBox) {
 fn build_translation_ops(
     page: &PageLayout,
     translated: &[(&Paragraph, &TypesetParagraph)],
-    font: &EmbeddedFont,
-    bold_font: Option<&EmbeddedFont>,
-    names: &ResourceNames,
+    fonts: &TranslationFonts<'_>,
     options: &ComposeOptions,
 ) -> Result<String> {
     let cover = options.mode == ComposeMode::Overlay;
@@ -512,7 +761,7 @@ fn build_translation_ops(
     for (paragraph, typeset_paragraph) in translated {
         for line in &typeset_paragraph.lines {
             for segment in &line.segments {
-                write_text_run(&mut out, segment, line, font, bold_font, names);
+                write_text_run(&mut out, segment, line, fonts);
             }
             for formula in &line.formulas {
                 let scale = formula.scale;
@@ -535,7 +784,8 @@ fn build_translation_ops(
                     dest.height()
                 );
                 let _ = writeln!(out, "{scale:.4} 0 0 {scale:.4} {dx:.3} {dy:.3} cm");
-                let name = names
+                let name = fonts
+                    .names
                     .formulas
                     .get(&paragraph.id)
                     .and_then(|entries| entries.get(&formula.id))
@@ -570,10 +820,27 @@ fn build_translation_ops(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Align, Column, Role};
     use lopdf::dictionary;
 
-    #[test]
-    fn only_link_annotations_are_removed() {
+    fn empty_page() -> PageLayout {
+        PageLayout {
+            index: 0,
+            x0: 0.0,
+            y0: 0.0,
+            width: 612.0,
+            height: 792.0,
+            rotation: 0,
+            layout_transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            glyph_signature: [0; 32],
+            lines: Vec::new(),
+            paragraphs: Vec::new(),
+            images: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+
+    fn document_with_annotations() -> (Document, ObjectId, ObjectId, ObjectId) {
         let mut document = Document::with_version("1.7");
         let page_id = document.new_object_id();
         let link_id = document.new_object_id();
@@ -583,6 +850,7 @@ mod tests {
             Object::Dictionary(dictionary! {
                 "Type" => "Annot",
                 "Subtype" => "Link",
+                "Rect" => Object::Array(vec![10.into(), 20.into(), 30.into(), 40.into()]),
             }),
         );
         document.objects.insert(
@@ -590,6 +858,7 @@ mod tests {
             Object::Dictionary(dictionary! {
                 "Type" => "Annot",
                 "Subtype" => "Square",
+                "Rect" => Object::Array(vec![10.into(), 20.into(), 30.into(), 40.into()]),
             }),
         );
         document.objects.insert(
@@ -602,13 +871,88 @@ mod tests {
                 ]),
             }),
         );
+        (document, page_id, link_id, square_id)
+    }
 
-        remove_link_annotations(&mut document, page_id).unwrap();
+    #[test]
+    fn annotations_without_translated_text_are_untouched() {
+        let (mut document, page_id, link_id, square_id) = document_with_annotations();
+        remap_link_annotations(&mut document, page_id, &empty_page(), &[]).unwrap();
         let page = document.get_dictionary(page_id).unwrap();
         let Object::Array(annots) = page.get(b"Annots").unwrap() else {
             panic!("Annots is not an array");
         };
-        assert_eq!(annots.len(), 1);
-        assert!(matches!(annots[0], Object::Reference(id) if id == square_id));
+        assert_eq!(annots.len(), 2);
+        for id in [link_id, square_id] {
+            let rect = document
+                .get_dictionary(id)
+                .unwrap()
+                .get(b"Rect")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert_eq!(rect[0].as_i64().unwrap(), 10);
+            assert_eq!(rect[3].as_i64().unwrap(), 40);
+        }
+    }
+
+    #[test]
+    fn link_rect_maps_proportionally_into_translated_lines() {
+        let (mut document, page_id, link_id, square_id) = document_with_annotations();
+        // Link covers the top half of the source paragraph.
+        document
+            .get_object_mut(link_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "Rect",
+                Object::Array(vec![100.into(), 150.into(), 200.into(), 200.into()]),
+            );
+        let paragraph = Paragraph {
+            id: "p0-0".into(),
+            page: 0,
+            bbox: BBox::new(100.0, 100.0, 200.0, 200.0),
+            text: String::new(),
+            line_indices: Vec::new(),
+            base_style: Default::default(),
+            font_size: 10.0,
+            column: Column::Full,
+            role: Role::Paragraph,
+            align: Align::Left,
+            protected: false,
+            has_formula: false,
+            formulas: Vec::new(),
+            prompt_text: None,
+            translation: None,
+        };
+        let typeset = TypesetParagraph {
+            lines: vec![TypesetLine {
+                baseline: 140.0,
+                size: 10.0,
+                bbox: BBox::new(100.0, 100.0, 300.0, 150.0),
+                segments: Vec::new(),
+                formulas: Vec::new(),
+            }],
+            scale: 1.0,
+            overflow: false,
+        };
+        let page = empty_page();
+        remap_link_annotations(&mut document, page_id, &page, &[(&paragraph, &typeset)]).unwrap();
+        let link = document.get_dictionary(link_id).unwrap();
+        let rect = link.get(b"Rect").unwrap().as_array().unwrap();
+        let values: Vec<f64> = rect
+            .iter()
+            .map(|value| match value {
+                Object::Integer(number) => *number as f64,
+                Object::Real(number) => f64::from(*number),
+                _ => panic!("unexpected rect entry"),
+            })
+            .collect();
+        // Top half of the source maps to the top half of the wider, shorter
+        // translated line box: x stretches 100..300, y maps 150..200 -> 125..150.
+        assert_eq!(values, vec![100.0, 125.0, 300.0, 150.0]);
+        let square = document.get_dictionary(square_id).unwrap();
+        assert_eq!(square.get(b"Rect").unwrap().as_array().unwrap().len(), 4);
     }
 }

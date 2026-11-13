@@ -179,6 +179,9 @@ fn can_join(
     frame: PageFrame,
     body_size: f64,
 ) -> bool {
+    if previous.glyphs.iter().any(|g| g.protected) != line.glyphs.iter().any(|g| g.protected) {
+        return false;
+    }
     let role = classify_line(line, page_index, frame, body_size);
     let previous_role = classify_line(previous, page_index, frame, body_size);
     if previous_role == Role::Caption
@@ -231,8 +234,9 @@ fn can_join(
         .text
         .trim_end()
         .ends_with(['.', '!', '?', ':', ';']);
-    let previous_is_body_line =
-        previous.text.chars().count() >= 20 && previous.bbox.width() > frame.width * 0.2;
+    let previous_is_body_line = previous.text.chars().count() >= 20
+        && previous.bbox.width() > frame.width * 0.2
+        && !super::tables::has_column_gap(previous);
     let role = if (role == Role::Caption || (role == Role::Heading && starts_lowercase))
         && previous_role == Role::Paragraph
         && previous_is_body_line
@@ -366,6 +370,10 @@ pub(super) fn make_paragraph(
         .map(|line| line.column)
         .unwrap_or(Column::Full);
     let has_formula = lines.clone().any(|line| line.formula);
+    let protected = has_formula
+        || lines
+            .clone()
+            .any(|line| line.glyphs.iter().any(|g| g.protected));
 
     Paragraph {
         id: format!("p{}-{index}", page_index + 1),
@@ -378,7 +386,7 @@ pub(super) fn make_paragraph(
         column,
         role: Role::Paragraph,
         align: Align::Left,
-        protected: has_formula,
+        protected,
         has_formula,
         formulas: Vec::new(),
         prompt_text: None,
@@ -400,6 +408,7 @@ pub(super) fn merge_caption_continuations(paragraphs: &mut Vec<Paragraph>) {
             let mut best_gap = f64::INFINITY;
             for (candidate_index, candidate) in paragraphs.iter().enumerate() {
                 if candidate_index == index
+                    || candidate.protected
                     || !(candidate.column == previous.column
                         || candidate.column == Column::Full
                         || previous.column == Column::Full)

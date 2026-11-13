@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 
-use crate::model::{Align, FormulaRef, LayoutDocument, PageLayout, Paragraph, TextStyle};
+use crate::model::{Align, BBox, FormulaRef, LayoutDocument, PageLayout, Paragraph, TextStyle};
 use crate::pdf::font::{EmbeddedFont, FontMetrics, FontSource};
 use crate::text::{bullet_marker, is_cjk};
 
@@ -29,6 +29,7 @@ pub struct TypesetSegment {
     pub x: f64,
     pub bold: bool,
     pub italic: bool,
+    pub color: [u8; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ pub struct TypesetFormula {
 pub struct TypesetLine {
     pub baseline: f64,
     pub size: f64,
-    pub color: [u8; 4],
+    pub bbox: BBox,
     pub segments: Vec<TypesetSegment>,
     pub formulas: Vec<TypesetFormula>,
 }
@@ -61,6 +62,8 @@ pub struct TypesetParagraph {
 pub struct TypesetDocument {
     pub font: EmbeddedFont,
     pub bold_font: Option<EmbeddedFont>,
+    pub italic_font: Option<EmbeddedFont>,
+    pub symbol_font: Option<EmbeddedFont>,
     pub paragraphs: HashMap<String, TypesetParagraph>,
 }
 
@@ -76,10 +79,10 @@ pub fn typeset_document(
     document: &LayoutDocument,
     font_source: &FontSource,
     bold_font_source: Option<&FontSource>,
+    italic_font_source: Option<&FontSource>,
+    symbol_font_source: Option<&FontSource>,
     options: &TypesetOptions,
 ) -> Result<(TypesetDocument, TypesetStats)> {
-    let mut regular_chars = BTreeSet::new();
-    let mut bold_chars = BTreeSet::new();
     let mut candidates = Vec::new();
     for page in &document.pages {
         for paragraph in &page.paragraphs {
@@ -94,23 +97,78 @@ pub fn typeset_document(
                 continue;
             }
             let tokens = tokenize(text, &paragraph.formulas, paragraph.base_style);
-            for (ch, style) in characters(&tokens) {
-                if style.bold && bold_font_source.is_some() {
-                    bold_chars.insert(ch);
-                } else {
-                    regular_chars.insert(ch);
-                }
-            }
             candidates.push((page, paragraph, tokens));
         }
     }
-    if regular_chars.is_empty() && bold_chars.is_empty() {
+    let all_chars: BTreeSet<char> = candidates
+        .iter()
+        .flat_map(|(_, _, tokens)| characters(tokens).map(|(ch, _)| ch))
+        .collect();
+    let regular_present: BTreeSet<char> = font_source
+        .metrics(all_chars.iter().copied())?
+        .char_to_gid
+        .into_keys()
+        .collect();
+    let bold_present = present_chars(bold_font_source, &all_chars)?;
+    let italic_present = present_chars(italic_font_source, &all_chars)?;
+    let symbol_present = present_chars(symbol_font_source, &all_chars)?;
+    let mut regular_chars = BTreeSet::new();
+    let mut bold_chars = BTreeSet::new();
+    let mut italic_chars = BTreeSet::new();
+    let mut symbol_chars = BTreeSet::new();
+    for (_, _, tokens) in &candidates {
+        for (ch, style) in characters(tokens) {
+            match pick_face(
+                style,
+                ch,
+                &regular_present,
+                bold_present.as_ref(),
+                italic_present.as_ref(),
+                symbol_present.as_ref(),
+            ) {
+                Some(FaceKind::Regular) => {
+                    regular_chars.insert(ch);
+                }
+                Some(FaceKind::Bold) => {
+                    bold_chars.insert(ch);
+                }
+                Some(FaceKind::Italic) => {
+                    italic_chars.insert(ch);
+                }
+                Some(FaceKind::Symbol) => {
+                    symbol_chars.insert(ch);
+                }
+                None => {}
+            }
+        }
+    }
+    if regular_chars.is_empty()
+        && bold_chars.is_empty()
+        && italic_chars.is_empty()
+        && symbol_chars.is_empty()
+    {
         bail!("no translated text to typeset");
     }
     let font = font_source.embed(&font_source.metrics(regular_chars)?)?;
     let bold_font = if let Some(source) = bold_font_source.filter(|_| !bold_chars.is_empty()) {
         let mut font = source.embed(&source.metrics(bold_chars)?)?;
         font.pdf_name.push_str("-Bold");
+        Some(font)
+    } else {
+        None
+    };
+    let italic_font = if let Some(source) = italic_font_source.filter(|_| !italic_chars.is_empty())
+    {
+        let mut font = source.embed(&source.metrics(italic_chars)?)?;
+        font.pdf_name.push_str("-Italic");
+        Some(font)
+    } else {
+        None
+    };
+    let symbol_font = if let Some(source) = symbol_font_source.filter(|_| !symbol_chars.is_empty())
+    {
+        let mut font = source.embed(&source.metrics(symbol_chars)?)?;
+        font.pdf_name.push_str("-Symbol");
         Some(font)
     } else {
         None
@@ -123,10 +181,15 @@ pub fn typeset_document(
     let metrics = Faces {
         regular: &font.metrics,
         bold: bold_font.as_ref().map(|f| &f.metrics),
+        italic: italic_font.as_ref().map(|f| &f.metrics),
+        symbol: symbol_font.as_ref().map(|f| &f.metrics),
     };
+    // Place captions first so any upward adjustment also constrains the
+    // downward expansion of the preceding translated paragraph.
+    candidates.sort_by_key(|(_, paragraph, _)| paragraph.role != crate::model::Role::Caption);
     for (page, paragraph, tokens) in candidates {
         let missing: BTreeSet<_> = characters(&tokens)
-            .filter(|(ch, style)| !metrics.for_style(*style).char_to_gid.contains_key(ch))
+            .filter(|(ch, _)| !metrics.has_any(*ch))
             .map(|(ch, _)| ch)
             .collect();
         if !missing.is_empty() {
@@ -143,8 +206,13 @@ pub fn typeset_document(
             );
             continue;
         }
-        let max_height = available_height(page, paragraph, options);
-        let typeset = typeset_paragraph(page, paragraph, &tokens, metrics, options, max_height);
+        let max_height = available_height(page, paragraph, options, &paragraphs);
+        let expanded = paragraph.bbox.height().max(paragraph.font_size) * options.max_expand;
+        let max_rise = available_caption_rise(page, paragraph, &paragraphs)
+            .min((expanded - max_height).max(0.0));
+        let typeset = typeset_paragraph(
+            page, paragraph, &tokens, metrics, options, max_height, max_rise,
+        );
         stats.paragraphs += 1;
         stats.smallest_scale = stats.smallest_scale.min(typeset.scale);
         if typeset.overflow {
@@ -162,36 +230,98 @@ pub fn typeset_document(
         TypesetDocument {
             font,
             bold_font,
+            italic_font,
+            symbol_font,
             paragraphs,
         },
         stats,
     ))
 }
 
-fn available_height(page: &PageLayout, paragraph: &Paragraph, options: &TypesetOptions) -> f64 {
+fn paragraph_obstacle(paragraph: &Paragraph, placed: &HashMap<String, TypesetParagraph>) -> BBox {
+    if paragraph.role == crate::model::Role::Caption
+        && let Some(caption) = placed.get(&paragraph.id)
+    {
+        caption
+            .lines
+            .iter()
+            .fold(paragraph.bbox, |bbox, line| bbox.union(line.bbox))
+    } else {
+        paragraph.bbox
+    }
+}
+
+fn available_caption_rise(
+    page: &PageLayout,
+    paragraph: &Paragraph,
+    placed: &HashMap<String, TypesetParagraph>,
+) -> f64 {
+    if paragraph.role != crate::model::Role::Caption {
+        return 0.0;
+    }
+    // Borrow at most half an em above a caption, only when needed to fit it.
+    // Keep the original lower boundary and all graphic clearances intact.
+    let mut top = (paragraph.bbox.y1 + paragraph.font_size * 0.5).min(page.y0 + page.height - 2.0);
+    for bbox in page
+        .paragraphs
+        .iter()
+        .filter(|other| other.id != paragraph.id)
+        .map(|other| paragraph_obstacle(other, placed))
+        .chain(page.images.iter().map(|image| image.bbox))
+        .chain(
+            page.rules
+                .iter()
+                .copied()
+                .filter(|rule| rule.width() > paragraph.font_size * 4.0),
+        )
+    {
+        if bbox.y1 > paragraph.bbox.y1 && paragraph.bbox.horizontal_overlap(bbox) > 0.0 {
+            top = top.min(bbox.y0 - 2.0);
+        }
+    }
+    (top - paragraph.bbox.y1).max(0.0)
+}
+
+fn available_height(
+    page: &PageLayout,
+    paragraph: &Paragraph,
+    options: &TypesetOptions,
+    placed: &HashMap<String, TypesetParagraph>,
+) -> f64 {
     let mut next_top: Option<f64> = None;
     for other in &page.paragraphs {
         if other.id == paragraph.id {
             continue;
         }
+        let bbox = paragraph_obstacle(other, placed);
         // Only paragraphs below this one can constrain it.
-        if other.bbox.y1 >= paragraph.bbox.y0 - 1.0 {
+        if bbox.y1 >= paragraph.bbox.y0 - 1.0 {
             continue;
         }
-        let horizontal_overlap = paragraph.bbox.horizontal_overlap(other.bbox);
+        let horizontal_overlap = paragraph.bbox.horizontal_overlap(bbox);
         let same_column = other.column == paragraph.column
             || other.column == crate::model::Column::Full
             || paragraph.column == crate::model::Column::Full;
         if horizontal_overlap < 0.15 && !same_column {
             continue;
         }
-        next_top = Some(next_top.map_or(other.bbox.y1, |current| current.max(other.bbox.y1)));
+        next_top = Some(next_top.map_or(bbox.y1, |current| current.max(bbox.y1)));
     }
 
     for image in &page.images {
         if image.bbox.y1 <= paragraph.bbox.y0 && paragraph.bbox.horizontal_overlap(image.bbox) > 0.0
         {
             next_top = Some(next_top.map_or(image.bbox.y1, |top| top.max(image.bbox.y1)));
+        }
+    }
+    // Vector figures and table borders may extend above their text labels.
+    // Their top rule must stop expansion just as the top of a raster image does.
+    for rule in &page.rules {
+        if rule.y1 <= paragraph.bbox.y0
+            && rule.width() > paragraph.font_size * 4.0
+            && paragraph.bbox.horizontal_overlap(*rule) > 0.15
+        {
+            next_top = Some(next_top.map_or(rule.y1, |top| top.max(rule.y1)));
         }
     }
     let bottom = next_top
@@ -238,15 +368,107 @@ fn available_heading_width(page: &PageLayout, paragraph: &Paragraph) -> f64 {
     width.max(paragraph.bbox.width())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FaceKind {
+    Regular,
+    Bold,
+    Italic,
+    Symbol,
+}
+
+fn present_chars(
+    source: Option<&FontSource>,
+    chars: &BTreeSet<char>,
+) -> Result<Option<BTreeSet<char>>> {
+    match source {
+        Some(source) => Ok(Some(
+            source
+                .metrics(chars.iter().copied())?
+                .char_to_gid
+                .into_keys()
+                .collect(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Prefer the style's own face, then borrow any face that actually has the
+/// glyph; the symbol face is the last resort before preserving the paragraph.
+fn pick_face(
+    style: TextStyle,
+    ch: char,
+    regular: &BTreeSet<char>,
+    bold: Option<&BTreeSet<char>>,
+    italic: Option<&BTreeSet<char>>,
+    symbol: Option<&BTreeSet<char>>,
+) -> Option<FaceKind> {
+    let preferred = if style.italic {
+        FaceKind::Italic
+    } else if style.bold {
+        FaceKind::Bold
+    } else {
+        FaceKind::Regular
+    };
+    for kind in [
+        preferred,
+        FaceKind::Regular,
+        FaceKind::Bold,
+        FaceKind::Italic,
+        FaceKind::Symbol,
+    ] {
+        let set = match kind {
+            FaceKind::Regular => Some(regular),
+            FaceKind::Bold => bold,
+            FaceKind::Italic => italic,
+            FaceKind::Symbol => symbol,
+        };
+        if set.is_some_and(|set| set.contains(&ch)) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 struct Faces<'a> {
     regular: &'a FontMetrics,
     bold: Option<&'a FontMetrics>,
+    italic: Option<&'a FontMetrics>,
+    symbol: Option<&'a FontMetrics>,
 }
 
 impl<'a> Faces<'a> {
-    fn for_style(self, style: TextStyle) -> &'a FontMetrics {
-        self.bold.filter(|_| style.bold).unwrap_or(self.regular)
+    fn for_char(self, style: TextStyle, ch: char) -> &'a FontMetrics {
+        let preferred = if style.italic {
+            self.italic
+        } else if style.bold {
+            self.bold
+        } else {
+            None
+        };
+        if let Some(face) = preferred.filter(|face| face.char_to_gid.contains_key(&ch)) {
+            return face;
+        }
+        for face in [Some(self.regular), self.bold, self.italic, self.symbol] {
+            if let Some(face) = face.filter(|face| face.char_to_gid.contains_key(&ch)) {
+                return face;
+            }
+        }
+        self.regular
+    }
+
+    fn text_width(self, style: TextStyle, text: &str, size: f64, letter_spacing: f64) -> f64 {
+        text.chars()
+            .map(|ch| self.for_char(style, ch).char_advance(ch, size))
+            .sum::<f64>()
+            + text.chars().count().saturating_sub(1) as f64 * letter_spacing
+    }
+
+    fn has_any(self, ch: char) -> bool {
+        self.regular.char_to_gid.contains_key(&ch)
+            || self.bold.is_some_and(|f| f.char_to_gid.contains_key(&ch))
+            || self.italic.is_some_and(|f| f.char_to_gid.contains_key(&ch))
+            || self.symbol.is_some_and(|f| f.char_to_gid.contains_key(&ch))
     }
 }
 
@@ -288,6 +510,7 @@ fn typeset_paragraph(
     metrics: Faces<'_>,
     options: &TypesetOptions,
     max_height: f64,
+    max_rise: f64,
 ) -> TypesetParagraph {
     let base_size = paragraph.font_size.clamp(6.0, 42.0);
     let max_width = if paragraph.role == crate::model::Role::Heading {
@@ -302,16 +525,12 @@ fn typeset_paragraph(
     } else {
         paragraph.bbox.width().max(base_size * 3.0)
     };
-    let color = paragraph
-        .lines(&page.lines)
-        .next()
-        .and_then(|line| line.spans.first())
-        .map(|span| span.color)
-        .unwrap_or([0, 0, 0, 255]);
     let mut chosen_size = base_size;
     let mut chosen_drafts: Vec<LineDraft> = Vec::new();
     let mut chosen_baselines = Vec::new();
+    let mut chosen_bounds = Vec::new();
     let mut chosen_scale = 1.0;
+    let mut chosen_rise = 0.0;
     let mut overflow = true;
     let list = list_prefix(page, paragraph, tokens);
     let body_tokens = list
@@ -352,7 +571,7 @@ fn typeset_paragraph(
         {
             balance_title_lines(tokens, &mut drafts, line_width, size, metrics);
         }
-        let (baselines, total_height) = draft_baselines(
+        let (baselines, bounds, total_height) = draft_baselines(
             &drafts,
             size,
             metrics,
@@ -364,7 +583,10 @@ fn typeset_paragraph(
         chosen_scale = scale;
         chosen_drafts = drafts;
         chosen_baselines = baselines;
-        let fits = total_height <= max_height && !drafts_too_wide(&chosen_drafts, max_width);
+        chosen_bounds = bounds;
+        chosen_rise = (total_height - max_height).max(0.0).min(max_rise);
+        let fits =
+            total_height <= max_height + max_rise && !drafts_too_wide(&chosen_drafts, max_width);
         if fits || scale <= options.min_scale + 1e-9 {
             overflow = !fits;
             break;
@@ -379,7 +601,7 @@ fn typeset_paragraph(
             Align::Center => paragraph.bbox.center_x() - draft.width * 0.5,
             Align::Right => paragraph.bbox.x1 - draft.width,
         };
-        let baseline = paragraph.bbox.y1 - chosen_baselines[index];
+        let baseline = paragraph.bbox.y1 + chosen_rise - chosen_baselines[index];
 
         let segments = draft
             .segments
@@ -387,8 +609,9 @@ fn typeset_paragraph(
             .map(|segment| TypesetSegment {
                 text: segment.text.clone(),
                 x: offset_x + segment.x,
-                bold: segment.bold,
-                italic: segment.italic,
+                bold: segment.style.bold,
+                italic: segment.style.italic,
+                color: segment.style.color.unwrap_or([0, 0, 0, 255]),
             })
             .collect::<Vec<_>>();
         let mut formulas = Vec::new();
@@ -403,10 +626,30 @@ fn typeset_paragraph(
                 scale: chosen_scale,
             });
         }
+        let (ascent, descent) = chosen_bounds[index];
+        let mut x0 = f64::INFINITY;
+        let mut x1 = f64::NEG_INFINITY;
+        for segment in &segments {
+            let style = TextStyle {
+                bold: segment.bold,
+                italic: segment.italic,
+                color: Some(segment.color),
+            };
+            x0 = x0.min(segment.x);
+            x1 = x1.max(segment.x + metrics.text_width(style, &segment.text, chosen_size, 0.0));
+        }
+        for formula in &formulas {
+            x0 = x0.min(formula.x);
+            x1 = x1.max(formula.x + formula.source_bbox.width() * formula.scale);
+        }
+        if !x0.is_finite() {
+            x0 = offset_x;
+            x1 = offset_x;
+        }
         lines.push(TypesetLine {
             baseline,
             size: chosen_size,
-            color,
+            bbox: BBox::new(x0, baseline - descent, x1, baseline + ascent),
             segments,
             formulas,
         });
@@ -426,19 +669,17 @@ fn draft_baselines(
     formulas: &[FormulaRef],
     line_height: f64,
     formula_scale: f64,
-) -> (Vec<f64>, f64) {
+) -> (Vec<f64>, Vec<(f64, f64)>, f64) {
     let mut baselines = Vec::with_capacity(drafts.len());
+    let mut bounds = Vec::with_capacity(drafts.len());
     let mut previous_descent = 0.0;
     let mut height = 0.0;
     for draft in drafts {
         let mut ascent: f64 = 0.0;
         let mut descent: f64 = 0.0;
         for segment in &draft.segments {
-            let face = metrics.for_style(TextStyle {
-                bold: segment.bold,
-                italic: segment.italic,
-            });
             for ch in segment.text.chars().filter(|ch| !ch.is_whitespace()) {
+                let face = metrics.for_char(segment.style, ch);
                 let (bottom, top) = face
                     .char_vertical_bounds
                     .get(&ch)
@@ -462,9 +703,10 @@ fn draft_baselines(
         });
         height = baseline + descent;
         baselines.push(baseline);
+        bounds.push((ascent, descent));
         previous_descent = descent;
     }
-    (baselines, height)
+    (baselines, bounds, height)
 }
 
 fn drafts_too_wide(drafts: &[LineDraft], max_width: f64) -> bool {
@@ -502,8 +744,7 @@ fn balance_title_lines(
 struct SegmentDraft {
     text: String,
     x: f64,
-    bold: bool,
-    italic: bool,
+    style: TextStyle,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -529,22 +770,20 @@ impl LineDraft {
         })
     }
 
-    fn push_text(&mut self, text: &str, width: f64, bold: bool, italic: bool) {
+    fn push_text(&mut self, text: &str, width: f64, style: TextStyle) {
         if text.is_empty() {
             return;
         }
         if !self.after_formula
             && let Some(last) = self.segments.last_mut()
-            && last.bold == bold
-            && last.italic == italic
+            && last.style == style
         {
             last.text.push_str(text);
         } else {
             self.segments.push(SegmentDraft {
                 text: text.to_string(),
                 x: self.width,
-                bold,
-                italic,
+                style,
             });
             self.after_formula = false;
         }
@@ -564,21 +803,13 @@ impl LineDraft {
         if closing {
             let trimmed = last.text.trim_end().len();
             let removed = last.text.split_off(trimmed);
-            self.width -= faces
-                .for_style(TextStyle {
-                    bold: last.bold,
-                    italic: last.italic,
-                })
-                .text_width(&removed, size, 0.0);
+            self.width -= faces.text_width(last.style, &removed, size, 0.0);
         }
         let mut ch = last.text.chars().next_back()?;
         if !closing && !is_opening_punctuation(ch) {
             return None;
         }
-        let style = TextStyle {
-            bold: last.bold,
-            italic: last.italic,
-        };
+        let style = last.style;
         let mut start = last.text.len() - ch.len_utf8();
         if closing {
             // A run such as “）。 ” belongs with the preceding content, not
@@ -599,7 +830,7 @@ impl LineDraft {
                 .map_or(start, |(index, _)| index);
         }
         let moved = last.text.split_off(start);
-        let width = faces.for_style(style).text_width(&moved, size, 0.0);
+        let width = faces.text_width(style, &moved, size, 0.0);
         self.width -= width;
         Some((moved, width, style))
     }
@@ -619,9 +850,7 @@ fn wrap_tokens(
         match token {
             Token::Newline => push_draft(&mut lines, &mut current, faces, size),
             Token::Space(style) => {
-                let metrics = faces.for_style(*style);
-                let TextStyle { bold, italic } = *style;
-                let width = metrics.char_advance(' ', size);
+                let width = faces.for_char(*style, ' ').char_advance(' ', size);
                 if current.width > 0.0
                     && (current.after_formula
                         || !current
@@ -629,13 +858,11 @@ fn wrap_tokens(
                             .last()
                             .is_some_and(|segment| segment.text.ends_with(' ')))
                 {
-                    current.push_text(" ", width, bold, italic);
+                    current.push_text(" ", width, *style);
                 }
             }
             Token::Text(piece, style) => {
-                let metrics = faces.for_style(*style);
-                let TextStyle { bold, italic } = *style;
-                let piece_width = metrics.text_width(piece, size, 0.0);
+                let piece_width = faces.text_width(*style, piece, size, 0.0);
                 // Font/style switches can split a single decimal or Latin word
                 // into several tokens (e.g. 0<i>.</i>0%). Fit those fragments
                 // together, including adjacent closing punctuation.
@@ -653,7 +880,7 @@ fn wrap_tokens(
                         {
                             break;
                         }
-                        required_width += faces.for_style(*style).text_width(text, size, 0.0);
+                        required_width += faces.text_width(*style, text, size, 0.0);
                     }
                 }
                 if required_width > max_width {
@@ -668,7 +895,7 @@ fn wrap_tokens(
                     let moved = current.take_for_break(is_closing_punctuation(piece), faces, size);
                     push_draft(&mut lines, &mut current, faces, size);
                     if let Some((text, width, style)) = moved {
-                        current.push_text(&text, width, style.bold, style.italic);
+                        current.push_text(&text, width, style);
                     }
                 }
 
@@ -676,9 +903,9 @@ fn wrap_tokens(
                     let mut buffer = String::new();
                     let mut width = 0.0;
                     for ch in piece.chars() {
-                        let advance = metrics.char_advance(ch, size);
+                        let advance = faces.for_char(*style, ch).char_advance(ch, size);
                         if width + advance > max_width && !buffer.is_empty() {
-                            current.push_text(&buffer, width, bold, italic);
+                            current.push_text(&buffer, width, *style);
                             push_draft(&mut lines, &mut current, faces, size);
                             buffer.clear();
                             width = 0.0;
@@ -686,9 +913,9 @@ fn wrap_tokens(
                         buffer.push(ch);
                         width += advance;
                     }
-                    current.push_text(&buffer, width, bold, italic);
+                    current.push_text(&buffer, width, *style);
                 } else {
-                    current.push_text(piece, piece_width, bold, italic);
+                    current.push_text(piece, piece_width, *style);
                 }
             }
             Token::Formula(id) => {
@@ -699,13 +926,12 @@ fn wrap_tokens(
                 for next in &tokens[index + 1..] {
                     match next {
                         Token::Space(style) => {
-                            spaces += faces.for_style(*style).char_advance(' ', size)
+                            spaces += faces.for_char(*style, ' ').char_advance(' ', size)
                         }
                         Token::Text(text, style)
                             if text.chars().all(is_closing_punctuation_char) =>
                         {
-                            required_width +=
-                                spaces + faces.for_style(*style).text_width(text, size, 0.0);
+                            required_width += spaces + faces.text_width(*style, text, size, 0.0);
                             spaces = 0.0;
                         }
                         _ => break,
@@ -737,12 +963,8 @@ fn push_draft(lines: &mut Vec<LineDraft>, current: &mut LineDraft, faces: Faces<
             let trimmed = segment.text.trim_end();
             let removed = segment.text.len() - trimmed.len();
             if removed > 0 {
-                draft.width -= faces
-                    .for_style(TextStyle {
-                        bold: segment.bold,
-                        italic: segment.italic,
-                    })
-                    .text_width(&segment.text[trimmed.len()..], size, 0.0);
+                draft.width -=
+                    faces.text_width(segment.style, &segment.text[trimmed.len()..], size, 0.0);
                 segment.text = trimmed.to_string();
             }
         }
@@ -772,6 +994,7 @@ fn tokenize(text: &str, formulas: &[FormulaRef], base: TextStyle) -> Vec<Token> 
         match piece {
             Piece::Bold(on) => style.bold = base.bold || on,
             Piece::Italic(on) => style.italic = base.italic || on,
+            Piece::Color(color) => style.color = color.or(base.color),
             Piece::Formula(id) => {
                 if let Some(index) = formulas.iter().position(|f| f.id == id) {
                     tokens.push(Token::Formula(index));
@@ -831,6 +1054,8 @@ fn wrap_text(
         Faces {
             regular: metrics,
             bold: None,
+            italic: None,
+            symbol: None,
         },
         &[],
         1.0,
@@ -1032,6 +1257,8 @@ mod tests {
                 Faces {
                     regular: &metrics,
                     bold: None,
+                    italic: None,
+                    symbol: None,
                 },
                 &formulas,
                 1.0,
@@ -1049,6 +1276,8 @@ mod tests {
             Faces {
                 regular: &metrics,
                 bold: None,
+                italic: None,
+                symbol: None,
             },
             &formulas,
             1.0,
@@ -1081,6 +1310,8 @@ mod tests {
         let faces = Faces {
             regular: &metrics,
             bold: None,
+            italic: None,
+            symbol: None,
         };
         let tokens = tokenize("一二三四五六七八九十甲", &[], TextStyle::default());
         let mut drafts = wrap_tokens(&tokens, 100.0, 10.0, faces, &[], 1.0);
@@ -1088,6 +1319,36 @@ mod tests {
         balance_title_lines(&tokens, &mut drafts, 100.0, 10.0, faces);
         assert_eq!(drafts.len(), 2);
         assert!((drafts[0].width - drafts[1].width).abs() <= 10.01);
+    }
+
+    #[test]
+    fn for_char_borrows_faces_that_have_the_glyph() {
+        let mut regular = metrics();
+        regular.char_to_gid.insert('ø', 1);
+        let mut italic = metrics();
+        italic.char_to_gid.insert('译', 2);
+        let mut symbol = metrics();
+        symbol.char_to_gid.insert('⟩', 3);
+        let faces = Faces {
+            regular: &regular,
+            bold: None,
+            italic: Some(&italic),
+            symbol: Some(&symbol),
+        };
+        let italic_style = TextStyle {
+            bold: false,
+            italic: true,
+            color: None,
+        };
+        assert!(std::ptr::eq(faces.for_char(italic_style, '译'), &italic));
+        assert!(std::ptr::eq(faces.for_char(italic_style, 'ø'), &regular));
+        assert!(std::ptr::eq(faces.for_char(italic_style, '⟩'), &symbol));
+        assert!(std::ptr::eq(
+            faces.for_char(TextStyle::default(), '⟩'),
+            &symbol
+        ));
+        assert!(faces.has_any('⟩'));
+        assert!(!faces.has_any('\u{31350}'));
     }
 
     #[test]
@@ -1099,6 +1360,8 @@ mod tests {
             Faces {
                 regular: &metrics(),
                 bold: None,
+                italic: None,
+                symbol: None,
             },
             &[],
             1.0,

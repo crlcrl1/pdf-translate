@@ -7,6 +7,7 @@ pub enum Piece<'a> {
     Formula(&'a str),
     Bold(bool),
     Italic(bool),
+    Color(Option<[u8; 4]>),
 }
 
 fn tag(text: &str) -> Option<(Piece<'_>, usize)> {
@@ -15,10 +16,19 @@ fn tag(text: &str) -> Option<(Piece<'_>, usize)> {
         ("</b>", Piece::Bold(false)),
         ("<i>", Piece::Italic(true)),
         ("</i>", Piece::Italic(false)),
+        ("</c>", Piece::Color(None)),
     ] {
         if text.starts_with(name) {
             return Some((piece, name.len()));
         }
+    }
+    if let Some(body) = text.strip_prefix("<c")
+        && body.as_bytes().get(8) == Some(&b'>')
+        && body.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit)
+    {
+        let mut color = [0; 4];
+        hex::decode_to_slice(&body[..8], &mut color).ok()?;
+        return Some((Piece::Color(Some(color)), 11));
     }
     let body = text.strip_prefix("<f")?;
     let digits = body.bytes().take_while(u8::is_ascii_digit).count();
@@ -58,22 +68,40 @@ pub fn decode_literal(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-pub fn style_open(style: TextStyle) -> &'static str {
-    match (style.bold, style.italic) {
+pub fn color_tag(color: Option<[u8; 4]>) -> String {
+    color.map_or_else(
+        || "</c>".to_owned(),
+        |color| format!("<c{}>", hex::encode(color)),
+    )
+}
+
+pub fn style_open(style: TextStyle) -> String {
+    let emphasis = match (style.bold, style.italic) {
         (false, false) => "",
         (true, false) => "<b>",
         (false, true) => "<i>",
         (true, true) => "<b><i>",
-    }
+    };
+    format!(
+        "{emphasis}{}",
+        style
+            .color
+            .map(|color| color_tag(Some(color)))
+            .unwrap_or_default()
+    )
 }
 
-pub fn style_close(style: TextStyle) -> &'static str {
-    match (style.bold, style.italic) {
+pub fn style_close(style: TextStyle) -> String {
+    let emphasis = match (style.bold, style.italic) {
         (false, false) => "",
         (true, false) => "</b>",
         (false, true) => "</i>",
         (true, true) => "</i></b>",
-    }
+    };
+    format!(
+        "{}{emphasis}",
+        if style.color.is_some() { "</c>" } else { "" }
+    )
 }
 
 pub fn strip_style_tags(text: &str) -> String {
@@ -100,23 +128,26 @@ pub fn coalesce_styles(text: &str) -> String {
         TextStyle {
             bold: true,
             italic: true,
+            color: None,
         },
         TextStyle {
             bold: true,
             italic: false,
+            color: None,
         },
         TextStyle {
             bold: false,
             italic: true,
+            color: None,
         },
     ] {
         let (open, close) = (style_open(style), style_close(style));
         let mut rest = text.as_str();
         let mut joined = String::new();
-        while let Some(end) = rest.find(close) {
+        while let Some(end) = rest.find(&close) {
             joined.push_str(&rest[..end]);
             rest = &rest[end + close.len()..];
-            if let Some(start) = rest.find(open)
+            if let Some(start) = rest.find(&open)
                 && pieces(&rest[..start]).all(|piece| match piece {
                     Piece::Formula(_) => true,
                     Piece::Text(text) => {
@@ -149,7 +180,7 @@ pub fn coalesce_styles(text: &str) -> String {
                 }
                 rest = &rest[start + open.len()..];
             } else {
-                joined.push_str(close);
+                joined.push_str(&close);
             }
         }
         joined.push_str(rest);
@@ -171,7 +202,7 @@ fn emphasis_counts(text: &str) -> [usize; 3] {
                 counts[1] += count * usize::from(style.bold);
                 counts[2] += count * usize::from(style.italic);
             }
-            Piece::Formula(_) => {}
+            Piece::Formula(_) | Piece::Color(_) => {}
         }
     }
     counts
@@ -210,6 +241,60 @@ fn preserves_emphasis_extent(source: &str, translation: &str) -> bool {
             || b[0] < 12
             || (a[i] as f64 / a[0] as f64 - b[i] as f64 / b[0] as f64).abs() <= 0.35
     })
+}
+
+fn color_extent(
+    text: &str,
+) -> (
+    std::collections::BTreeMap<Option<[u8; 4]>, usize>,
+    Vec<bool>,
+) {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut nonempty_runs = Vec::new();
+    let mut color = None;
+    for piece in pieces(text) {
+        match piece {
+            Piece::Color(next) => {
+                color = next;
+                if color.is_some() {
+                    nonempty_runs.push(false);
+                }
+            }
+            Piece::Text(text) => {
+                let text = decode_literal(text);
+                let count = text.chars().filter(|ch| ch.is_alphanumeric()).count();
+                if count > 0 {
+                    *counts.entry(color).or_insert(0) += count;
+                }
+                if color.is_some() && !text.trim().is_empty() {
+                    *nonempty_runs.last_mut().unwrap() = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    (counts, nonempty_runs)
+}
+
+fn preserves_color_extent(source: &str, translation: &str) -> bool {
+    if !pieces(source).any(|piece| matches!(piece, Piece::Color(_))) {
+        return true;
+    }
+    let (a, source_runs) = color_extent(source);
+    let (b, translated_runs) = color_extent(translation);
+    let total_a = a.values().sum::<usize>();
+    let total_b = b.values().sum::<usize>();
+    source_runs.len() == translated_runs.len()
+        && source_runs
+            .iter()
+            .zip(translated_runs)
+            .all(|(a, b)| !a || b)
+        && a.keys().eq(b.keys())
+        && a.iter().all(|(color, count)| {
+            total_a < 40
+                || total_b < 12
+                || (*count as f64 / total_a as f64 - b[color] as f64 / total_b as f64).abs() <= 0.35
+        })
 }
 
 /// Restore unambiguously literal markers before validating formula order and styles.
@@ -298,11 +383,13 @@ pub fn validate_translation(
     if actual_sorted != expected_sorted {
         return None;
     }
-    let styles = |piece: &Piece<'_>| matches!(piece, Piece::Bold(_) | Piece::Italic(_));
+    let styles =
+        |piece: &Piece<'_>| matches!(piece, Piece::Bold(_) | Piece::Italic(_) | Piece::Color(_));
     if pieces(source)
         .filter(styles)
         .eq(pieces(&text).filter(styles))
         && preserves_emphasis_extent(source, &text)
+        && preserves_color_extent(source, &text)
     {
         Some(text)
     } else {
@@ -313,6 +400,57 @@ pub fn validate_translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_spans_preserve_codes_and_do_not_swallow_plain_prose() {
+        let source = "<c00008cff>Smith</c> reports that the method significantly improves accuracy. <cff0000ff><b>Warning</b></c>: check the result.";
+        let translated = "<c00008cff>Smith</c>报告该方法显著提高了准确率。<cff0000ff><b>警告</b></c>：检查结果。";
+        assert_eq!(
+            validate_translation(source, translated, &[]).as_deref(),
+            Some(translated)
+        );
+        for invalid in [
+            translated.replace("00008cff", "00ff00ff"),
+            translated.replace("<c00008cff>Smith</c>", "Smith"),
+            translated.replace("<c00008cff>Smith</c>", "<c00008cff></c>Smith"),
+            "<c00008cff>Smith报告该方法显著提高了准确率。</c><cff0000ff><b>警告</b></c>：检查结果。".into(),
+        ] {
+            assert!(validate_translation(source, &invalid, &[]).is_none(), "{invalid}");
+        }
+        let repeated = "<c00008cff>Smith</c> and <c00008cff>Jones</c> discuss the result.";
+        let emptied = "<c00008cff></c>Smith和<c00008cff>Jones</c>讨论该结果。";
+        assert!(validate_translation(repeated, emptied, &[]).is_none());
+        assert_eq!(
+            validate_translation(
+                "Literal &lt;c00008cff&gt; marker",
+                "字面<c00008cff>标记",
+                &[]
+            )
+            .as_deref(),
+            Some("字面&lt;c00008cff&gt;标记")
+        );
+    }
+
+    #[test]
+    fn color_changes_do_not_split_a_continuous_emphasis_span() {
+        let plain = TextStyle {
+            italic: true,
+            ..Default::default()
+        };
+        let red = TextStyle {
+            color: Some([255, 0, 0, 255]),
+            ..plain
+        };
+        let source = [(plain, "There are "), (red, "7 "), (plain, "cars here.")]
+            .into_iter()
+            .map(|(style, text)| format!("{}{text}{}", style_open(style), style_close(style)))
+            .collect::<String>();
+        let joined = coalesce_styles(&source);
+        assert_eq!(joined, "<i>There are <cff0000ff>7 </c>cars here.</i>");
+        assert!(
+            validate_translation(&joined, "<i>这里有<cff0000ff>7</c>辆车。</i>", &[]).is_some()
+        );
+    }
 
     #[test]
     fn emphasis_cannot_spread_to_unstyled_prose_or_disappear() {

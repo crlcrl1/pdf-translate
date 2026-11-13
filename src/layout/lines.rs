@@ -1,7 +1,8 @@
 use super::{
     PageFrame,
     inline::{
-        is_math_char, is_math_glyph, is_math_operator, is_named_math_operator, math_char_ratio,
+        is_math_char, is_math_glyph, is_math_only, is_math_operator, is_named_math_operator,
+        math_char_ratio,
     },
     paragraphs::is_roman_numeral_digit,
 };
@@ -344,7 +345,32 @@ fn build_line(mut line: LineAcc) -> Option<TextLine> {
         .filter(|g| !is_math_glyph(g) && g.text.chars().any(|ch| ch.is_alphabetic()))
         .collect();
     prose.sort_by(|a, b| a.font_size.total_cmp(&b.font_size));
-    let (baseline, font_size) = if prose.len() >= 4 {
+    // Synthetic small caps use full-size initials and smaller uppercase
+    // letters on the same baseline. The smaller letters are a presentation
+    // choice, not the nominal size of the heading in another writing system.
+    let small_caps = prose
+        .last()
+        .filter(|base| {
+            prose.len() >= 4
+                && prose.iter().any(|g| g.font_size < base.font_size * 0.9)
+                && prose.iter().all(|g| {
+                    g.text.chars().all(char::is_uppercase)
+                        && g.font_size >= base.font_size * 0.7
+                        && (g.origin_y - base.origin_y).abs() < base.font_size * 0.06
+                        && g.font_name == base.font_name
+                        && g.bold == base.bold
+                        && g.italic == base.italic
+                })
+        })
+        .map(|g| (g.origin_y, g.font_size));
+    // A word-sized subscript (D_dist, x_train, ...) can outvote its base.
+    // Establish the baseline from ordinary full-sized letters instead.
+    if let Some(largest) = prose.last().map(|g| g.font_size) {
+        prose.retain(|g| g.font_size >= largest * 0.8);
+    }
+    let (baseline, font_size) = if let Some(size) = small_caps {
+        size
+    } else if prose.len() >= 4 {
         let dominant = prose[prose.len() / 2];
         (dominant.origin_y, dominant.font_size)
     } else {
@@ -474,6 +500,9 @@ pub(super) fn is_formula_line(line: &TextLine) -> bool {
     if line.text.trim().is_empty() {
         return false;
     }
+    if is_math_only(line) {
+        return true;
+    }
     let span_formula = line.spans.iter().any(|span| span.formula);
     let math_ratio = line.math_ratio;
     let char_ratio = math_char_ratio(&line.text);
@@ -560,6 +589,96 @@ pub(super) fn is_formula_line(line: &TextLine) -> bool {
         || math_ratio > 0.55
         || (char_ratio > 0.35 && line.text.chars().filter(|c| is_math_char(*c)).count() >= 2)
         || display_like
+}
+
+/// An equation number anchors all fragments on its row, including ordinary
+/// words used as parameters or qualifiers inside a display equation.
+pub(super) fn protect_numbered_equations(lines: &mut [TextLine], frame: PageFrame) {
+    let mut protected = Vec::new();
+    for number in lines.iter() {
+        let Some(label) = number
+            .text
+            .trim()
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+        else {
+            continue;
+        };
+        if label.is_empty()
+            || !label.chars().any(|c| c.is_ascii_digit())
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+            || number.bbox.width() > number.font_size * 6.0
+        {
+            continue;
+        }
+        let (left, width) = match number.column {
+            Column::Full => (frame.x0, frame.width),
+            Column::Left => (frame.x0, frame.width * 0.5),
+            Column::Right => (frame.center_x(), frame.width * 0.5),
+        };
+        if number.bbox.x0 < left + width * 0.7 {
+            continue;
+        }
+        let parts: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.column == number.column
+                    && line.bbox.x1 < number.bbox.x0 - number.font_size * 0.8
+                    && (line.baseline - number.baseline).abs()
+                        < line.font_size.max(number.font_size) * 0.65
+            })
+            .collect();
+        if parts
+            .iter()
+            .any(|(_, line)| line.text.chars().any(is_math_operator))
+        {
+            protected.extend(parts.into_iter().map(|(index, _)| index));
+        }
+    }
+    for index in protected {
+        lines[index].formula = true;
+    }
+}
+
+/// Adjacent captions can share a reading baseline on an otherwise single-column
+/// page. Split at the label and gutter before joining caption continuations.
+pub(super) fn split_caption_lines(lines: &mut Vec<TextLine>) {
+    let mut split = Vec::new();
+    for line in std::mem::take(lines) {
+        let boundary = if super::paragraphs::caption_kind(&line.text).is_some() {
+            (1..line.glyphs.len()).find(|&i| {
+                line.glyphs[i].bbox.x0 - line.glyphs[i - 1].bbox.x1 > line.font_size * 0.5
+                    && super::paragraphs::caption_kind(
+                        &line.glyphs[i..]
+                            .iter()
+                            .map(|g| g.text.as_str())
+                            .collect::<String>(),
+                    )
+                    .is_some()
+            })
+        } else {
+            None
+        };
+        if let Some(boundary) = boundary {
+            for glyphs in [&line.glyphs[..boundary], &line.glyphs[boundary..]] {
+                let bbox = glyphs.iter().map(|g| g.bbox).reduce(BBox::union).unwrap();
+                if let Some(mut part) = build_line(LineAcc {
+                    glyphs: glyphs.to_vec(),
+                    bbox,
+                    baseline: line.baseline,
+                    font_size: line.font_size,
+                    angle: glyphs[0].angle,
+                }) {
+                    part.column = line.column;
+                    split.push(part);
+                }
+            }
+        } else {
+            split.push(line);
+        }
+    }
+    *lines = split;
 }
 
 /// A large extensible brace binds every row of a cases expression. Its text
