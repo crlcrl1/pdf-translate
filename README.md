@@ -14,8 +14,9 @@ tables, formulas, headers and footers where they were. It extracts glyphs, fonts
 reconstructs lines, paragraphs and columns, translates paragraph by paragraph through any OpenAI-compatible API, and
 typesets the result with an embedded CJK font.
 
-The current release is a CLI (`inspect` and `translate`) plus a Zotero 7+ plugin that calls the CLI. The CLI can write
-a translated-only PDF or a side-by-side bilingual PDF; a GUI and local HTTP server are still planned.
+The current release includes a CLI (`inspect` and `translate`), an optional desktop GUI (`gui`), and a Zotero 7+
+plugin that calls the CLI. It can write a translated-only PDF or a side-by-side bilingual PDF; a local HTTP server is
+still planned.
 
 ![Original page (left) and translated page (right)](docs/images/compare-page1.png)
 
@@ -158,6 +159,20 @@ Inspect the extracted layout as JSON:
 pdf-translate inspect paper.pdf --pages 1-2 -o layout.json
 ```
 
+### Desktop GUI
+
+Build the optional native GUI and open a PDF directly:
+
+```bash
+cargo build --release --features gui
+target/release/pdf-translate gui paper.pdf
+```
+
+The GUI supports drag-and-drop, translation options, structured progress, cancellation, original/translated page
+previews, and opening the generated PDF. Settings use the same TOML file as the CLI. The appearance selector supports
+system, light, and dark themes; save the settings to persist the choice. GUI builds use the latest `eframe`/`egui`,
+`rfd`, and `open` crates and require the platform's normal desktop graphics libraries.
+
 The JSON contains each page's lines, paragraphs, bounding boxes, fonts, formula markers and `protected` flags — useful
 for debugging layout decisions. Omit `-o` to print it to stdout; add `--compact` for compact JSON.
 
@@ -174,13 +189,15 @@ explicitly selected file that does not exist is an error. Unknown keys are rejec
 Precedence: command-line flags > config file > `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` > built-in
 defaults.
 
-Path, page range, overlay mode, annotation handling and other document-specific choices stay on the command line.
+Path, page range, overlay mode, annotation handling and other document-specific choices are supplied per job by the
+CLI or GUI.
 
 ## CLI reference
 
 ```text
 pdf-translate inspect <input.pdf> [--pages 1-] [-o layout.json] [--compact]
 pdf-translate translate <input.pdf> [-o output.pdf] [options]
+pdf-translate gui [input.pdf]  # requires the `gui` feature
 ```
 
 | Option                   | Description                                           |
@@ -265,7 +282,7 @@ Implemented:
 
 Not implemented yet:
 
-- GUI, local HTTP server and paragraph-level Zotero overlays;
+- local HTTP server and paragraph-level Zotero overlays;
 - OCR for scanned PDFs (overlay mode can preserve the scan, but does not recognize text);
 - table text translation (table regions are protected);
 - moving link rectangles with the translated text;
@@ -285,15 +302,21 @@ These capabilities target common digital-born papers, not the full PDF specifica
 cargo fmt
 cargo test
 cargo clippy --all-targets
+cargo test --features gui
+cargo clippy --all-targets --features gui
 ```
 
 Module layout:
 
 ```text
 src/
-  main.rs        CLI entry point
+  main.rs        CLI and GUI entry point
   cli.rs         clap arguments
   config.rs      global TOML config
+  workflow.rs    shared translation requests, progress and cancellation
+  gui.rs         optional native desktop interface
+  gui/
+    preview.rs   hayro page rendering for the GUI
   model.rs       page/line/paragraph/glyph model
   markup.rs      formula placeholders, literal text and style tags
   output.rs      output identity checks and atomic writes

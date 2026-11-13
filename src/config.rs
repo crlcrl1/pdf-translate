@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable that overrides the default configuration path.
 pub const CONFIG_PATH_ENV: &str = "PDF_TRANSLATE_CONFIG";
@@ -12,17 +12,33 @@ pub const CONFIG_PATH_ENV: &str = "PDF_TRANSLATE_CONFIG";
 /// Settings that are independent of the document being translated.
 ///
 /// Document-specific choices (input/output paths, page ranges, overlay mode,
-/// annotation handling, ...) deliberately stay on the command line. Command
+/// annotation handling, ...) are supplied per job by the CLI or GUI. Command
 /// line flags also override the corresponding values from this file.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub api: ApiConfig,
     pub translation: TranslationConfig,
     pub typeset: TypesetConfig,
+    pub gui: GuiConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuiConfig {
+    pub theme: ThemeMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     /// OpenAI-compatible base URL, without `/chat/completions`.
@@ -39,7 +55,7 @@ pub struct ApiConfig {
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranslationConfig {
     /// Target language code.
@@ -48,7 +64,7 @@ pub struct TranslationConfig {
     pub concurrency: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TypesetConfig {
     /// Optional CJK font file (.ttf/.otf/.ttc).
@@ -93,6 +109,18 @@ impl Config {
             .with_context(|| format!("invalid configuration file {}", path.display()))?;
         tracing::debug!("loaded configuration from {}", path.display());
         Ok(config)
+    }
+
+    #[cfg(feature = "gui")]
+    pub fn save(&self, explicit: Option<&Path>) -> Result<PathBuf> {
+        let path = explicit
+            .map(Path::to_path_buf)
+            .or_else(|| env::var_os(CONFIG_PATH_ENV).map(PathBuf::from))
+            .or_else(default_path)
+            .context("cannot determine the configuration directory")?;
+        let text = toml::to_string_pretty(self).context("cannot serialize configuration")?;
+        crate::output::write_private_bytes(&path, text.as_bytes())?;
+        Ok(path)
     }
 }
 
@@ -179,6 +207,48 @@ mod tests {
         assert!(config.api.base_url.is_none());
         assert!(config.translation.concurrency.is_none());
         assert!(config.typeset.font.is_none());
+    }
+
+    #[test]
+    fn gui_theme_round_trips_through_toml() {
+        let config = Config {
+            gui: GuiConfig {
+                theme: ThemeMode::Dark,
+            },
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("theme = \"dark\""));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.gui.theme, ThemeMode::Dark);
+    }
+
+    #[cfg(all(unix, feature = "gui"))]
+    #[test]
+    fn saved_config_is_private_even_when_replacing_a_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            api: ApiConfig {
+                api_key: Some("secret".to_string()),
+                ..ApiConfig::default()
+            },
+            ..Config::default()
+        };
+        config.save(Some(&path)).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        config.save(Some(&path)).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

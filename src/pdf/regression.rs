@@ -1665,7 +1665,7 @@ fn output_uses_the_pdf_that_was_analyzed_even_if_input_is_replaced() {
     let mut fixture = Fixture::new(BODY);
     fixture.save();
     let (original, mut layout) =
-        crate::load_layout(&fixture.input, "1-", Default::default()).unwrap();
+        crate::workflow::load_layout(&fixture.input, "1-", Default::default()).unwrap();
     std::fs::write(&fixture.input, b"This file has been replaced.").unwrap();
     layout.pages[0].paragraphs[0].translation = Some("From the original.".into());
     let (set, _) = typeset(&layout, "ttf", 0.72);

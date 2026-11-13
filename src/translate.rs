@@ -12,6 +12,7 @@ mod client;
 
 use crate::markup::{strip_style_tags, validate_translation};
 use crate::model::{LayoutDocument, Role};
+use crate::progress::{CancellationToken, ProgressEvent, ProgressSink};
 use crate::text::is_section_number;
 
 #[derive(Debug, Clone)]
@@ -54,10 +55,13 @@ struct BulletCacheSource {
     context: String,
 }
 
-pub fn translate_document(
+pub fn translate_document_observed(
     document: &mut LayoutDocument,
     options: &TranslationOptions,
+    progress: &ProgressSink,
+    cancel: &CancellationToken,
 ) -> Result<TranslationStats> {
+    cancel.check()?;
     if !options.fake && options.api_key.is_none() && !is_local_endpoint(&options.api_base) {
         bail!(
             "missing API key: set [api].api_key in the config file, set OPENAI_API_KEY, \
@@ -94,8 +98,16 @@ pub fn translate_document(
         tasks
             .par_iter()
             .map(|task| {
-                let result = translate_task(task, options, client.as_ref(), &cache);
+                let result = if cancel.is_cancelled() {
+                    Err(anyhow::anyhow!("translation cancelled"))
+                } else {
+                    translate_task(task, options, client.as_ref(), &cache)
+                };
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                progress(ProgressEvent::Translation {
+                    completed: done,
+                    total,
+                });
                 if done == 1 || done.is_multiple_of(10) || done == total {
                     tracing::info!("translated {done}/{total}");
                 }
@@ -103,6 +115,7 @@ pub fn translate_document(
             })
             .collect()
     });
+    cancel.check()?;
     let mut updates = HashMap::new();
     for (task, result) in tasks.into_iter().zip(results) {
         match result {

@@ -62,20 +62,32 @@ pub fn destinations(
 }
 
 pub fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    atomic_write_with_mode(path, None, write)
+}
+
+fn atomic_write_with_mode(
+    path: &Path,
+    mode: Option<u32>,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
     let parent = parent_dir(path);
     fs::create_dir_all(parent)?;
     let mut builder = Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o666));
+        builder.permissions(fs::Permissions::from_mode(mode.unwrap_or(0o666)));
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut temp = builder.tempfile_in(parent)?;
     if let Ok(metadata) = fs::metadata(path) {
         if !metadata.is_file() {
             bail!("output is not a regular file: {}", path.display());
         }
-        temp.as_file().set_permissions(metadata.permissions())?;
+        if mode.is_none() {
+            temp.as_file().set_permissions(metadata.permissions())?;
+        }
     }
     write(temp.as_file_mut()).with_context(|| format!("failed to write {}", path.display()))?;
     temp.as_file_mut().flush()?;
@@ -86,4 +98,16 @@ pub fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) ->
 
 pub fn write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     atomic_write(path, |file| Ok(file.write_all(data)?))
+}
+
+#[cfg(feature = "gui")]
+pub fn write_private_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        atomic_write_with_mode(path, Some(0o600), |file| Ok(file.write_all(data)?))
+    }
+    #[cfg(not(unix))]
+    {
+        write_bytes(path, data)
+    }
 }

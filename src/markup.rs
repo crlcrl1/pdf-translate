@@ -92,7 +92,7 @@ pub fn strip_style_tags(text: &str) -> String {
     out
 }
 
-/// PDF line breaks and bound formulas do not end a prose emphasis run.
+/// PDF line breaks, bound formulas and minor font transitions do not end a prose emphasis run.
 /// Formula glyphs retain their original style independently of these tags.
 pub fn coalesce_styles(text: &str) -> String {
     let mut text = text.to_owned();
@@ -119,11 +119,34 @@ pub fn coalesce_styles(text: &str) -> String {
             if let Some(start) = rest.find(open)
                 && pieces(&rest[..start]).all(|piece| match piece {
                     Piece::Formula(_) => true,
-                    Piece::Text(text) => text.chars().all(char::is_whitespace),
+                    Piece::Text(text) => {
+                        let text = decode_literal(text);
+                        text.chars().all(|ch| !ch.is_alphabetic())
+                            || (!text.chars().any(char::is_whitespace) && text.chars().count() <= 4)
+                    }
                     _ => false,
                 })
             {
-                joined.push_str(&rest[..start]);
+                let gap = &rest[..start];
+                let has_bare_word = !gap.chars().any(char::is_whitespace)
+                    && pieces(gap).any(|piece| {
+                        matches!(piece, Piece::Text(text) if text.chars().any(char::is_alphanumeric))
+                    });
+                if has_bare_word {
+                    if joined.chars().last().is_some_and(char::is_alphanumeric) {
+                        joined.push(' ');
+                    }
+                    joined.push_str(gap);
+                    if rest[start + open.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric)
+                    {
+                        joined.push(' ');
+                    }
+                } else {
+                    joined.push_str(gap);
+                }
                 rest = &rest[start + open.len()..];
             } else {
                 joined.push_str(close);
@@ -346,6 +369,28 @@ mod tests {
         }
         let separate = "<i>First </i><f1> and <i>second </i><f2>.";
         assert_eq!(coalesce_styles(separate), separate);
+    }
+
+    #[test]
+    fn minor_font_transitions_do_not_fragment_prose() {
+        assert_eq!(
+            coalesce_styles("<i>up to 152 layers—8</i>× <i>deeper than VGG</i>"),
+            "<i>up to 152 layers—8× deeper than VGG</i>"
+        );
+        assert_eq!(
+            coalesce_styles("<i>on the ImageNet</i>test<i>set. This result</i>"),
+            "<i>on the ImageNet test set. This result</i>"
+        );
+        assert_eq!(
+            coalesce_styles("<i>submissions to ILSVRC</i> &amp; <i>COCO 2015</i>"),
+            "<i>submissions to ILSVRC &amp; COCO 2015</i>"
+        );
+        assert_eq!(
+            coalesce_styles("<i>competitions</i>1, <i>where we won</i>"),
+            "<i>competitions1, where we won</i>"
+        );
+        let intentional = "<i>italic</i> ordinary <i>italic again</i>";
+        assert_eq!(coalesce_styles(intentional), intentional);
     }
 
     #[test]

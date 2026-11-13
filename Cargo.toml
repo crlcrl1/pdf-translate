@@ -12,6 +12,7 @@ default = ["embedded-fonts"]
 # uses the synthetic bold renderer.
 embedded-fonts = []
 embedded-bold-font = ["embedded-fonts"]
+gui = ["dep:eframe", "dep:rfd", "dep:open"]
 
 [dependencies]
 anyhow = "1"
@@ -36,6 +37,9 @@ ttf-parser = "0.25"
 unicode-blocks = "0.1"
 unicode-math-class = "0.1"
 toml = "0.9"
+eframe = { version = "0.37.0", optional = true }
+rfd = { version = "0.18.0", optional = true }
+open = { version = "5.4.5", optional = true }
 
 [profile.release]
 lto = "thin"

@@ -11,7 +11,7 @@
 `pdf-translate` 把数字版学术论文的正文替换为目标语言，同时让图片、表格线、公式、页眉页脚和页面几何保持原位。它提取字形、字体、颜色、图片和坐标，重建行、段落与分栏，逐段调用任意
 OpenAI 兼容接口翻译，再用内置的 Noto Serif CJK SC 子集重新排版。
 
-当前版本提供 CLI（`inspect` 与 `translate`），以及一个调用该 CLI 的 Zotero 7+ 插件；CLI 可输出纯译文 PDF，也可输出左右并排的双语 PDF。GUI 和本地 HTTP 服务仍在规划中。
+当前版本提供 CLI（`inspect` 与 `translate`）、可选桌面 GUI（`gui`），以及一个调用该 CLI 的 Zotero 7+ 插件；可输出纯译文 PDF，也可输出左右并排的双语 PDF。本地 HTTP 服务仍在规划中。
 
 ![原始页面（左）与中文译文页面（右）](docs/images/compare-page1.png)
 
@@ -146,17 +146,29 @@ JSON 中包含每页的行、段落、bbox、字体、公式标记和 `protected
 - Linux/macOS：`$XDG_CONFIG_HOME/pdf-translate/config.toml`，默认 `~/.config/pdf-translate/config.toml`
 - Windows：`%APPDATA%\pdf-translate\config.toml`
 
+### 桌面 GUI
+
+构建可选原生 GUI，并在启动时直接打开 PDF：
+
+```bash
+cargo build --release --features gui
+target/release/pdf-translate gui paper.pdf
+```
+
+GUI 支持拖入 PDF、常用翻译选项、实时进度、取消、原文/译文页面预览，以及打开生成的 PDF。设置与 CLI 共用同一份 TOML 配置；外观可选择跟随系统、浅色或深色，保存设置后会记住主题。GUI 使用最新版 `eframe`/`egui`、`rfd` 和 `open`，运行时需要平台常规的桌面图形库。
+
 也可以用 `--config PATH` 或环境变量 `PDF_TRANSLATE_CONFIG` 指定另一个文件。默认位置的文件不存在时使用内置默认值；显式指定的文件不存在会报错。未知配置项会被拒绝。
 
 优先级为：命令行参数 > 配置文件 > `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` 环境变量 > 内置默认值。
 
-输入/输出路径、页范围、overlay 模式、注释处理等与具体文档相关的选项仍通过命令行传入。
+输入/输出路径、页范围、overlay 模式、注释处理等与具体文档相关的选项由 CLI 或 GUI 按任务提供。
 
 ## 命令行
 
 ```text
 pdf-translate inspect <input.pdf> [--pages 1-] [-o layout.json] [--compact]
 pdf-translate translate <input.pdf> [-o output.pdf] [options]
+pdf-translate gui [input.pdf]  # 需要 `gui` feature
 ```
 
 | 参数                     | 说明                                    |
@@ -229,7 +241,7 @@ pdf-translate translate paper.pdf --bilingual -o paper.bilingual.pdf
 
 尚未实现：
 
-- GUI、本地 HTTP 服务、段落级 Zotero 覆盖层；
+- 本地 HTTP 服务、段落级 Zotero 覆盖层；
 - OCR（扫描件目前只能用 overlay 模式保留原图，不做文字识别）；
 - 表格文字翻译（表格区域通常被保护）；
 - 链接矩形随译文移动；
@@ -248,15 +260,21 @@ pdf-translate translate paper.pdf --bilingual -o paper.bilingual.pdf
 cargo fmt
 cargo test
 cargo clippy --all-targets
+cargo test --features gui
+cargo clippy --all-targets --features gui
 ```
 
 模块结构：
 
 ```text
 src/
-  main.rs        CLI 入口
+  main.rs        CLI 与 GUI 入口
   cli.rs         clap 参数
   config.rs      全局 TOML 配置
+  workflow.rs    共享翻译任务、进度与取消
+  gui.rs         可选原生桌面界面
+  gui/
+    preview.rs   使用 hayro 渲染 GUI 页面预览
   model.rs       页/行/段/字形数据模型
   markup.rs      公式占位符、字面文本和样式标记
   output.rs      输出文件身份检查与原子写入

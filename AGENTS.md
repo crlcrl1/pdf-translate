@@ -7,6 +7,7 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
 - Verify with `cargo fmt && cargo test && cargo clippy --all-targets`. Keep the tree fmt/clippy clean.
 - There is no library target. `cargo test` runs unit tests inside `src/**` plus `tests/cli_smoke.rs`; use `cargo test --test cli_smoke` for only the CLI tests. Filter with `cargo test <substring>`.
 - Iterate with debug builds. `[profile.release]` uses thin LTO, `codegen-units = 1`, `strip`, and embeds the compressed CJK fonts, so release builds are much slower.
+- Build the optional desktop GUI with `--features gui`, launch it with `pdf-translate gui [input.pdf]`, and verify it with `cargo test --features gui` and `cargo clippy --all-targets --features gui`. GUI uses eframe/egui, rfd and open; it must start on the main thread while translation and preview rendering stay on large-stack workers.
 - Manual smoke test without a model: `cargo run -- translate <pdf> --fake --limit 5 -o /tmp/out.pdf`. Inspect layout JSON with `cargo run -- inspect <pdf> --pages 1`. `samples/` is gitignored/local-only.
 - The test suite is offline and needs no API key or network. Keep new tests offline (use `--fake`, fake clients, or pure functions).
 - Zotero plugin: `node --test zotero/test/*.test.mjs`; syntax-check the scripts with `node --check`; build the XPI with `./zotero/build.sh` (output is gitignored under `zotero/dist/`).
@@ -16,6 +17,8 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
 
 - Single binary crate rooted at `src/main.rs`; there is no `lib.rs`. Unit tests live in the module files.
 - Pipeline: extract (`hayro`) → layout → translate (OpenAI-compatible API + JSON cache) → typeset (CJK) → compose.
+  - `src/workflow.rs` builds shared translation requests and runs the pipeline for CLI/GUI; `src/progress.rs` defines structured progress and cooperative cancellation.
+  - `src/gui.rs` and `src/gui/preview.rs` implement the optional native GUI, including system/light/dark themes and hayro page previews.
   - `src/pdf/`: PDF parsing, content-stream rewriting, fonts, composition (`clean` default deletes replaced glyphs; `overlay` covers the original).
   - `src/layout/`: line/paragraph/column heuristics.
   - `src/model.rs`: shared layout structures; `src/typeset.rs`: CJK wrapping and font fitting.
@@ -36,6 +39,6 @@ Repo-specific guidance for OpenCode sessions. `README.md` is the user-facing ref
 ## Config and build quirks
 
 - Default features embed the regular Noto Serif CJK SC face (`assets/fonts/*.zst`); `embedded-bold-font` adds the bold face; `--no-default-features` switches to system fonts and needs a CJK face at runtime.
-- Precedence: CLI flags > `--config`/`PDF_TRANSLATE_CONFIG` > `OPENAI_*` env > built-in defaults. Unknown TOML keys are rejected; an explicitly selected config file must exist.
+- Precedence: CLI flags > `--config`/`PDF_TRANSLATE_CONFIG` > `OPENAI_*` env > built-in defaults. Unknown TOML keys are rejected; an explicitly selected config file must exist. GUI settings save back to the selected config, and `[gui].theme` accepts `system`, `light` or `dark`.
 - `--fake` needs no API key; a loopback API base also works without one.
 - MIT project: BabelDOC and DocLayout-YOLO are AGPL and only appear as optional references in the design doc; do not port their code/models without a licensing decision.

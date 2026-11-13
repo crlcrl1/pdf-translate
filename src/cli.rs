@@ -24,6 +24,16 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Translate an academic PDF and write a new PDF.
     Translate(TranslateArgs),
+    /// Open the desktop graphical interface.
+    #[cfg(feature = "gui")]
+    Gui(GuiArgs),
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Args)]
+pub struct GuiArgs {
+    /// Open this PDF in the preview pane at startup.
+    pub input: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
