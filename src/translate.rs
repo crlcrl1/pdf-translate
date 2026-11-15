@@ -307,8 +307,8 @@ fn unbound_bullet_source(text: &str, formulas: &[String], marker: char) -> Optio
     let mut source = format!("{marker}{body}");
     // IDs can skip literal <fN> text in the original document. Shift through
     // the actual ID sequence, not by subtracting one from the numeric suffix.
-    for ids in formulas.windows(2) {
-        source = source.replace(&format!("<{}>", ids[1]), &format!("<{}>", ids[0]));
+    for [previous, next] in formulas.array_windows() {
+        source = source.replace(&format!("<{}>", next), &format!("<{}>", previous));
     }
     Some(source)
 }
@@ -336,8 +336,8 @@ fn migrate_bullet_cache(
         return None;
     }
     let mut body = text.strip_prefix(marker)?.trim_start().to_owned();
-    for ids in task.formulas.windows(2).rev() {
-        body = body.replace(&format!("<{}>", ids[0]), &format!("<{}>", ids[1]));
+    for [previous, next] in task.formulas.array_windows().rev() {
+        body = body.replace(&format!("<{}>", previous), &format!("<{}>", next));
     }
     let output = format!("<{}> {body}", task.formulas.first()?);
     let output = validate_translation(&task.text, &output, &task.formulas)?;

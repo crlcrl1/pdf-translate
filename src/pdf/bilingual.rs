@@ -300,8 +300,16 @@ mod tests {
             .unwrap();
         assert!((width - (612.0 * 2.0 + GUTTER)).abs() < 0.1);
         let content = document.get_page_content(pages[&1]);
-        assert!(content.windows(10).any(|window| window == b"/PTOrig Do"));
-        assert!(content.windows(11).any(|window| window == b"/PTTrans Do"));
+        assert!(
+            content
+                .array_windows()
+                .any(|window| window == b"/PTOrig Do")
+        );
+        assert!(
+            content
+                .array_windows()
+                .any(|window| window == b"/PTTrans Do")
+        );
     }
 
     #[test]

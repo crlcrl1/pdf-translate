@@ -755,8 +755,8 @@ fn is_valid_formula_text(glyphs: &[&GlyphBox], text: &str) -> bool {
     if has_math_font
         || has_operator
         || glyphs
-            .windows(2)
-            .any(|pair| is_script_pair(pair[0], pair[1]))
+            .array_windows()
+            .any(|[first, second]| is_script_pair(first, second))
     {
         return true;
     }

@@ -453,15 +453,16 @@ pub(super) fn assign_columns(lines: &mut Vec<TextLine>, frame: PageFrame) {
             // building paragraphs, including adjacent table/figure captions.
             let boundary = line
                 .glyphs
-                .windows(2)
+                .array_windows()
                 .enumerate()
-                .filter(|(_, pair)| {
-                    let center = (pair[0].bbox.x1 + pair[1].bbox.x0) * 0.5;
+                .filter(|(_, [left, right])| {
+                    let center = (left.bbox.x1 + right.bbox.x0) * 0.5;
                     (center - mid).abs() < frame.width * 0.1
-                        && pair[1].bbox.x0 - pair[0].bbox.x1 > line.font_size * 1.1
+                        && right.bbox.x0 - left.bbox.x1 > line.font_size * 1.1
                 })
-                .max_by(|(_, a), (_, b)| {
-                    (a[1].bbox.x0 - a[0].bbox.x1).total_cmp(&(b[1].bbox.x0 - b[0].bbox.x1))
+                .max_by(|(_, [left, right]), (_, [other_left, other_right])| {
+                    (right.bbox.x0 - left.bbox.x1)
+                        .total_cmp(&(other_right.bbox.x0 - other_left.bbox.x1))
                 })
                 .map(|(i, _)| i + 1);
             if let Some(boundary) = boundary.filter(|&i| i >= 3 && line.glyphs.len() - i >= 3) {

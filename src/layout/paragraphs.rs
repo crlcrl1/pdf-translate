@@ -125,10 +125,10 @@ pub(super) fn build_paragraphs(
                 .unwrap_or(Ordering::Equal)
         });
         let mut leading: Vec<_> = indices
-            .windows(2)
-            .filter_map(|pair| {
-                let a = &lines[pair[0]];
-                let b = &lines[pair[1]];
+            .array_windows()
+            .filter_map(|&[first, second]| {
+                let a = &lines[first];
+                let b = &lines[second];
                 let ratio = (a.baseline - b.baseline) / a.font_size;
                 (!a.formula
                     && !b.formula

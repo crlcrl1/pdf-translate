@@ -14,8 +14,8 @@ impl Row<'_> {
         let mut boxes: Vec<_> = self.lines.iter().map(|line| line.bbox).collect();
         boxes.sort_by(|a, b| a.x0.total_cmp(&b.x0));
         boxes
-            .windows(2)
-            .any(|pair| pair[1].x0 - pair[0].x1 > self.size * 0.8)
+            .array_windows()
+            .any(|[left, right]| right.x0 - left.x1 > self.size * 0.8)
             || self.lines.iter().any(|line| has_column_gap(line))
     }
 
@@ -42,8 +42,8 @@ pub(super) fn has_column_gap(line: &TextLine) -> bool {
         .collect();
     glyphs.sort_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0));
     glyphs
-        .windows(2)
-        .any(|pair| pair[1].bbox.x0 - pair[0].bbox.x1 > line.font_size * 1.3)
+        .array_windows()
+        .any(|[left, right]| right.bbox.x0 - left.bbox.x1 > line.font_size * 1.3)
 }
 
 /// Table borders provide stronger evidence than the wording of their cells.
