@@ -191,6 +191,45 @@ fn missing_explicit_config_file_is_an_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn translation_cache_follows_the_configured_cache_directory() {
+    let dir = unique_dir();
+    let cache_home = dir.join("cache-home");
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("sample.pdf");
+    let output = dir.join("translated.pdf");
+    let config = dir.join("config.toml");
+    write_sample_pdf(&input);
+    // The fixture is too tight for the default minimum scale.
+    std::fs::write(&config, "[typeset]\nmin_scale = 0.3\n").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_pdf-translate"))
+        .arg("translate")
+        .arg(&input)
+        .arg("--fake")
+        .arg("--config")
+        .arg(&config)
+        .arg("-o")
+        .arg(&output)
+        .env("XDG_CACHE_HOME", &cache_home)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "translate failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        cache_home
+            .join("pdf-translate")
+            .join("translations.json")
+            .is_file(),
+        "translation cache was not written below XDG_CACHE_HOME"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_input_and_output_directories_are_resolved_before_writing() {

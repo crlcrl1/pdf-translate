@@ -126,27 +126,13 @@ impl Config {
     }
 }
 
-/// Default configuration path: `$XDG_CONFIG_HOME/pdf-translate/config.toml`
-/// (or `~/.config/pdf-translate/config.toml`); on Windows,
-/// `%APPDATA%\pdf-translate\config.toml`.
+/// Default configuration path in the platform configuration directory:
+/// `$XDG_CONFIG_HOME/pdf-translate/config.toml` (usually
+/// `~/.config/pdf-translate/config.toml`) on Linux,
+/// `~/Library/Application Support/pdf-translate/config.toml` on macOS and
+/// `%APPDATA%\pdf-translate\config.toml` on Windows.
 pub fn default_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        env::var_os("APPDATA").map(|base| {
-            PathBuf::from(base)
-                .join("pdf-translate")
-                .join("config.toml")
-        })
-    }
-
-    #[cfg(not(windows))]
-    {
-        let base = env::var_os("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-        Some(base.join("pdf-translate").join("config.toml"))
-    }
+    dirs::config_dir().map(|base| base.join("pdf-translate").join("config.toml"))
 }
 
 #[cfg(test)]

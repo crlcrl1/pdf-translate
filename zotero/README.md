@@ -45,7 +45,8 @@ Configuration (API endpoint, model, key, concurrency, font, …) comes from the
 normal `pdf-translate` config file, so the plugin needs no separate API
 settings:
 
-- Linux/macOS: `~/.config/pdf-translate/config.toml`
+- Linux: `$XDG_CONFIG_HOME/pdf-translate/config.toml` (default `~/.config/pdf-translate/config.toml`)
+- macOS: `~/Library/Application Support/pdf-translate/config.toml`
 - Windows: `%APPDATA%\pdf-translate\config.toml`
 
 Use **Tools → PDF Translate: Check command** to verify that Zotero can run the

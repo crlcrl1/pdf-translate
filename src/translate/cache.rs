@@ -4,10 +4,17 @@ use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+/// Translation cache file in the platform cache directory.
+///
+/// `XDG_CACHE_HOME` is honored on every platform so the cache can be
+/// redirected explicitly (tests rely on this); otherwise [`dirs::cache_dir`]
+/// selects `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS and
+/// `$XDG_CACHE_HOME` or `~/.cache` on Linux.
 pub(super) fn cache_path() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir);
     base.join("pdf-translate").join("translations.json")
 }

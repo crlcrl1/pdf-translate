@@ -20,6 +20,7 @@ gui = ["dep:eframe", "dep:rfd", "dep:open"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
+dirs = "7"
 fontdb = "0.24"
 ruzstd = { version = "0.9", optional = true }
 hayro = { version = "0.9", features = ["embed-fonts", "embed-cmaps"] }

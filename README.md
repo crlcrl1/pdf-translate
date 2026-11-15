@@ -58,8 +58,10 @@ The default pipeline is:
 2. **Analyze** lines, paragraphs, columns, headings, formulas, footnotes, headers/footers and references with geometric
    heuristics.
 3. **Translate** each paragraph via `/chat/completions`, preserving citations, numbers, URLs and `<fN>` / `<b>` / `<i>` / `<cRRGGBBAA>`
-   markers. Results are cached in `$XDG_CACHE_HOME/pdf-translate/translations.json` (or
-   `~/.cache/pdf-translate/translations.json`).
+   markers. Results are cached in the platform cache directory
+   (`~/.cache/pdf-translate/translations.json` on Linux, `~/Library/Caches/pdf-translate/translations.json`
+   on macOS, `%LOCALAPPDATA%\pdf-translate\translations.json` on Windows); `XDG_CACHE_HOME` overrides the base
+   directory on every platform.
 4. **Typeset** the translation with a subset of Noto Serif CJK SC: wrap, justify, shrink to fit, and fall back to the
    original when it cannot fit safely.
 5. **Compose** a new page: `clean` removes only the replaced glyphs, while `overlay` paints background patches over the
@@ -117,7 +119,8 @@ System fonts keep their own licenses.
 
 ## Quick start
 
-Create `~/.config/pdf-translate/config.toml` (Linux/macOS) or `%APPDATA%\pdf-translate\config.toml` (Windows):
+Create `~/.config/pdf-translate/config.toml` (Linux), `~/Library/Application Support/pdf-translate/config.toml`
+(macOS) or `%APPDATA%\pdf-translate\config.toml` (Windows):
 
 ```toml
 [api]
@@ -197,7 +200,8 @@ for debugging layout decisions. Omit `-o` to print it to stdout; add `--compact`
 
 Settings that do not depend on the document live in a global TOML file:
 
-- Linux/macOS: `$XDG_CONFIG_HOME/pdf-translate/config.toml` (default `~/.config/pdf-translate/config.toml`)
+- Linux: `$XDG_CONFIG_HOME/pdf-translate/config.toml` (default `~/.config/pdf-translate/config.toml`)
+- macOS: `~/Library/Application Support/pdf-translate/config.toml`
 - Windows: `%APPDATA%\pdf-translate\config.toml`
 
 Use `--config PATH` or `PDF_TRANSLATE_CONFIG` to select another file. A missing default file means built-in defaults; an

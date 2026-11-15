@@ -36,8 +36,9 @@ PDF ──▶ 提取 ──▶ 版面分析 ──▶ 翻译 ──▶ 排版 �
 
 1. **提取**：用 [hayro](https://crates.io/crates/hayro) 收集字形、字体元数据、颜色、图片、裁剪和变换。
 2. **分析**：用几何启发式识别行、段落、分栏、标题、公式、脚注、页眉页脚和参考文献。
-3. **翻译**：逐段调用 `/chat/completions`，保留引文、数字、URL 以及 `<fN>` / `<b>` / `<i>` / `<cRRGGBBAA>` 标记。结果缓存在
-   `$XDG_CACHE_HOME/pdf-translate/translations.json`（或 `~/.cache/pdf-translate/translations.json`）。
+3. **翻译**：逐段调用 `/chat/completions`，保留引文、数字、URL 以及 `<fN>` / `<b>` / `<i>` / `<cRRGGBBAA>` 标记。结果缓存在平台缓存目录
+   （Linux 为 `~/.cache/pdf-translate/translations.json`，macOS 为 `~/Library/Caches/pdf-translate/translations.json`，
+   Windows 为 `%LOCALAPPDATA%\pdf-translate\translations.json`）；各平台都可用 `XDG_CACHE_HOME` 覆盖缓存根目录。
 4. **排版**：用 Noto Serif CJK SC 子集断行、两端对齐、缩小字号以适应原段落，无法安全放下时回退原文。
 5. **合成**：`clean` 只删除已替换的字形；`overlay` 用背景块覆盖原文后在上方绘制译文。
 
@@ -87,7 +88,8 @@ DejaVu Serif 使用 Bitstream Vera / DejaVu 许可（[`assets/fonts/LICENSE-Deja
 
 ## 快速开始
 
-创建 `~/.config/pdf-translate/config.toml`（Linux/macOS）或 `%APPDATA%\pdf-translate\config.toml`（Windows）：
+创建 `~/.config/pdf-translate/config.toml`（Linux）、`~/Library/Application Support/pdf-translate/config.toml`
+（macOS）或 `%APPDATA%\pdf-translate\config.toml`（Windows）：
 
 ```toml
 [api]
@@ -153,7 +155,8 @@ JSON 中包含每页的行、段落、bbox、字体、公式标记和 `protected
 
 与具体文档无关的设置放在全局 TOML 配置文件中：
 
-- Linux/macOS：`$XDG_CONFIG_HOME/pdf-translate/config.toml`，默认 `~/.config/pdf-translate/config.toml`
+- Linux：`$XDG_CONFIG_HOME/pdf-translate/config.toml`，默认 `~/.config/pdf-translate/config.toml`
+- macOS：`~/Library/Application Support/pdf-translate/config.toml`
 - Windows：`%APPDATA%\pdf-translate\config.toml`
 
 ### 桌面 GUI
