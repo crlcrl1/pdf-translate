@@ -195,67 +195,9 @@ impl<'a> Device<'a> for Trace<'_> {
             self.remove_rule();
         }
     }
-    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
-        let Image::Stencil(stencil) = image else {
-            return;
-        };
-        let bbox = BBox::from_kurbo(
-            props
-                .transform
-                .transform_rect_bbox(Rect::new(0.0, 0.0, 1.0, 1.0)),
-        );
-        if bbox.height() > 1.5
-            || bbox.width() < bbox.height() * 3.0
-            || props.soft_mask.is_some()
-            || props.blend_mode != hayro::hayro_interpret::BlendMode::Normal
-            || u64::from(stencil.width()) * u64::from(stencil.height()) > 4096
-        {
-            return;
-        }
-        let Some(index) = self.drawings.iter().position(|formula| {
-            bbox.x0 >= formula.bbox.x0 - 1.0
-                && bbox.x1 <= formula.bbox.x1 + 1.0
-                && bbox.y0 >= formula.bbox.y0
-                && bbox.y1 <= formula.bbox.y1
-        }) else {
-            return;
-        };
-        let mut solid_color = None;
-        stencil.with_stencil(
-            |mask, paint| {
-                if mask.data.iter().all(|alpha| *alpha == 255)
-                    && let hayro::hayro_interpret::Paint::Color(color) = paint
-                {
-                    let rgba = color.to_rgba().to_rgba8();
-                    if rgba[3] == 255 {
-                        solid_color = Some(rgba);
-                    }
-                }
-            },
-            None,
-        );
-        let Some(color) = solid_color else {
-            return;
-        };
-        // Some PDF producers encode fraction and radical bars as solid tiny
-        // stencil images. Preserve their exact rectangle in the formula Form.
-        let formula = &mut self.drawings[index];
-        formula.bbox = formula.bbox.union(bbox);
-        let _ = writeln!(
-            formula.content,
-            "q {} {} {} rg {} {} {} {} re f Q",
-            f64::from(color[0]) / 255.,
-            f64::from(color[1]) / 255.,
-            f64::from(color[2]) / 255.,
-            bbox.x0,
-            bbox.y0,
-            bbox.width(),
-            bbox.height()
-        );
-        self.remove_rule();
-    }
+
     fn push_clip_path(&mut self, _: &ClipPath) {}
-    fn pop_clip(&mut self) {}
+
     fn push_transparency_group(
         &mut self,
         _: f32,
@@ -263,18 +205,7 @@ impl<'a> Device<'a> for Trace<'_> {
         _: hayro::hayro_interpret::BlendMode,
     ) {
     }
-    fn pop_transparency_group(&mut self) {}
-    fn begin_marked_content(&mut self, tag: &[u8], props: Option<&Dict<'_>>) {
-        let marker = if self.calls.is_some() && tag == TRACE_TAG {
-            props.and_then(|p| Some((p.get::<u32>(b"Id")? as usize, p.get::<bool>(b"Probe")?)))
-        } else {
-            None
-        };
-        self.active.push(marker);
-    }
-    fn end_marked_content(&mut self) {
-        self.active.pop();
-    }
+
     fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, mode: &DrawMode) {
         let marker = self.active.iter().rev().flatten().next().copied();
         let mut call = None;
@@ -355,5 +286,82 @@ impl<'a> Device<'a> for Trace<'_> {
         if let Some(c) = call {
             c.recorded = true;
         }
+    }
+
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
+        let Image::Stencil(stencil) = image else {
+            return;
+        };
+        let bbox = BBox::from_kurbo(
+            props
+                .transform
+                .transform_rect_bbox(Rect::new(0.0, 0.0, 1.0, 1.0)),
+        );
+        if bbox.height() > 1.5
+            || bbox.width() < bbox.height() * 3.0
+            || props.soft_mask.is_some()
+            || props.blend_mode != hayro::hayro_interpret::BlendMode::Normal
+            || u64::from(stencil.width()) * u64::from(stencil.height()) > 4096
+        {
+            return;
+        }
+        let Some(index) = self.drawings.iter().position(|formula| {
+            bbox.x0 >= formula.bbox.x0 - 1.0
+                && bbox.x1 <= formula.bbox.x1 + 1.0
+                && bbox.y0 >= formula.bbox.y0
+                && bbox.y1 <= formula.bbox.y1
+        }) else {
+            return;
+        };
+        let mut solid_color = None;
+        stencil.with_stencil(
+            |mask, paint| {
+                if mask.data.iter().all(|alpha| *alpha == 255)
+                    && let hayro::hayro_interpret::Paint::Color(color) = paint
+                {
+                    let rgba = color.to_rgba().to_rgba8();
+                    if rgba[3] == 255 {
+                        solid_color = Some(rgba);
+                    }
+                }
+            },
+            None,
+        );
+        let Some(color) = solid_color else {
+            return;
+        };
+        // Some PDF producers encode fraction and radical bars as solid tiny
+        // stencil images. Preserve their exact rectangle in the formula Form.
+        let formula = &mut self.drawings[index];
+        formula.bbox = formula.bbox.union(bbox);
+        let _ = writeln!(
+            formula.content,
+            "q {} {} {} rg {} {} {} {} re f Q",
+            f64::from(color[0]) / 255.,
+            f64::from(color[1]) / 255.,
+            f64::from(color[2]) / 255.,
+            bbox.x0,
+            bbox.y0,
+            bbox.width(),
+            bbox.height()
+        );
+        self.remove_rule();
+    }
+
+    fn pop_clip(&mut self) {}
+
+    fn pop_transparency_group(&mut self) {}
+
+    fn begin_marked_content(&mut self, tag: &[u8], props: Option<&Dict<'_>>) {
+        let marker = if self.calls.is_some() && tag == TRACE_TAG {
+            props.and_then(|p| Some((p.get::<u32>(b"Id")? as usize, p.get::<bool>(b"Probe")?)))
+        } else {
+            None
+        };
+        self.active.push(marker);
+    }
+
+    fn end_marked_content(&mut self) {
+        self.active.pop();
     }
 }

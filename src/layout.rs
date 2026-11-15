@@ -2071,7 +2071,7 @@ mod tests {
             text_line("0, otherwise", 280.0, 485.0),
             text_line("The expression gives the required bound.", 72.0, 460.0),
         ];
-        super::lines::protect_cases(&mut lines);
+        lines::protect_cases(&mut lines);
         assert!(lines[0].formula && lines[1].formula);
         assert!(!lines[2].formula);
     }

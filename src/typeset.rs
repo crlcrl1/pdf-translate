@@ -39,7 +39,7 @@ pub struct TypesetFormula {
     pub id: String,
     pub x: f64,
     pub baseline: f64,
-    pub source_bbox: crate::model::BBox,
+    pub source_bbox: BBox,
     pub source_baseline: f64,
     pub scale: f64,
 }
@@ -1068,12 +1068,7 @@ fn characters(tokens: &[Token]) -> impl Iterator<Item = (char, TextStyle)> {
 }
 
 #[cfg(test)]
-fn wrap_text(
-    text: &str,
-    max_width: f64,
-    size: f64,
-    metrics: &crate::pdf::font::FontMetrics,
-) -> Vec<String> {
+fn wrap_text(text: &str, max_width: f64, size: f64, metrics: &FontMetrics) -> Vec<String> {
     wrap_tokens(
         &tokenize(text, &[], TextStyle::default()),
         max_width,
@@ -1183,8 +1178,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn metrics() -> crate::pdf::font::FontMetrics {
-        crate::pdf::font::FontMetrics {
+    fn metrics() -> FontMetrics {
+        FontMetrics {
             units_per_em: 1000.0,
             ascender: 880.0,
             descender: -120.0,
@@ -1254,7 +1249,7 @@ mod tests {
             sources: Vec::new(),
             id: "f1".into(),
             text: "x".into(),
-            bbox: crate::model::BBox {
+            bbox: BBox {
                 x0: 0.0,
                 y0: 0.0,
                 x1: 30.0,
