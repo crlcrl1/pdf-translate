@@ -252,8 +252,9 @@ The default is `clean`:
 retains the covered source text underneath, so it is the fallback for scans and for pages where clean rewriting is not
 possible. `--no-cover` disables the patches.
 
-By default, link rectangles that cover translated text are moved to the translated positions (mapped proportionally
-within each paragraph); links over untranslated content stay in place. Forms, comments, redactions and other
+By default, links on validated colored spans (such as citations) and preserved inline objects follow their actual
+typeset positions, with separate hit areas when a link wraps across lines. Links without a reliable text match fall back
+to proportional mapping within the paragraph; links over untranslated content stay in place. Forms, comments, redactions and other
 annotations are always kept. Use `--keep-annotations` to keep link rectangles at their original positions instead.
 
 Neither mode is a general redaction tool for metadata, attachments, annotations or every PDF channel.
@@ -261,8 +262,11 @@ Neither mode is a general redaction tool for metadata, attachments, annotations 
 ## Bilingual side-by-side
 
 `--bilingual` writes a new PDF whose pages contain the original page on the left and the translated page on the right. It
-is intended for comparison reading in Zotero or any PDF viewer; annotations on the original page are not copied into the
-combined PDF. Page rotations of 0/90/180/270 degrees and cropped page origins are supported. The Zotero plugin enables it by
+is intended for comparison reading in Zotero or any PDF viewer. Clickable links from both pages are preserved: external
+URLs remain clickable, and internal links jump to the corresponding half of the destination page. Link rectangles and
+quadrilaterals follow each page's crop, rotation and placement. `--keep-annotations` retains the translated-side link areas
+at their original positions within that half; otherwise they follow the translated text. Other annotation types are not
+copied into the combined PDF. Page rotations of 0/90/180/270 degrees and cropped page origins are supported. The Zotero plugin enables it by
 default, so the imported attachment opens as one side-by-side document.
 
 ```bash

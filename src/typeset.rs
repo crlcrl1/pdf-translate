@@ -27,6 +27,8 @@ impl Default for TypesetOptions {
 pub struct TypesetSegment {
     pub text: String,
     pub x: f64,
+    /// Per-character hit boxes, in the same order as `text.chars()`.
+    pub glyph_boxes: Vec<BBox>,
     pub bold: bool,
     pub italic: bool,
     pub color: [u8; 4],
@@ -606,12 +608,37 @@ fn typeset_paragraph(
         let segments = draft
             .segments
             .iter()
-            .map(|segment| TypesetSegment {
-                text: segment.text.clone(),
-                x: offset_x + segment.x,
-                bold: segment.style.bold,
-                italic: segment.style.italic,
-                color: segment.style.color.unwrap_or([0, 0, 0, 255]),
+            .map(|segment| {
+                let mut x = offset_x + segment.x;
+                let glyph_boxes = segment
+                    .text
+                    .chars()
+                    .map(|ch| {
+                        let face = metrics.for_char(segment.style, ch);
+                        let advance = face.char_advance(ch, chosen_size);
+                        let (bottom, top) = face
+                            .char_vertical_bounds
+                            .get(&ch)
+                            .copied()
+                            .unwrap_or((face.descender / face.units_per_em, face.ascent_ratio()));
+                        let bbox = BBox::new(
+                            x,
+                            baseline + bottom * chosen_size,
+                            x + advance,
+                            baseline + top * chosen_size,
+                        );
+                        x += advance;
+                        bbox
+                    })
+                    .collect();
+                TypesetSegment {
+                    text: segment.text.clone(),
+                    x: offset_x + segment.x,
+                    glyph_boxes,
+                    bold: segment.style.bold,
+                    italic: segment.style.italic,
+                    color: segment.style.color.unwrap_or([0, 0, 0, 255]),
+                }
             })
             .collect::<Vec<_>>();
         let mut formulas = Vec::new();

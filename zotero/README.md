@@ -56,10 +56,10 @@ binary.
 - Open a PDF in Zotero and click **翻译** in the reader toolbar.
 - Or right-click a PDF attachment / a parent item and choose **Translate PDF**.
   If several items are selected, the jobs run one after another.
-- The plugin first looks for an existing bilingual attachment for this paper
-  (identified by its hidden note) and opens it if its file is newer than the
-  source PDF. Otherwise it checks the cache descriptor and reuses that. Only
-  when neither is valid does it run `pdf-translate` again.
+- The plugin checks the cache descriptor against the source PDF, settings and
+  binary. When it matches, it opens the recorded bilingual attachment or imports
+  the cached file if the attachment is missing. Otherwise it runs `pdf-translate`
+  again; older attachments are retained.
 - The bilingual PDF is added under the original parent item and opened in a
   reader tab of the same Zotero window. Disable **Import the translated PDF as
   an attachment** to keep the library untouched and open the cache in the
@@ -96,7 +96,7 @@ The plugin settings are under **Edit → Settings → PDF Translate**:
 | Composition mode | `clean` | `clean` or `overlay` |
 | Side-by-side bilingual | on | Add `--bilingual`: original left, translation right |
 | Translate the reference list | off | `--translate-references` |
-| Keep link annotations in place | off | `--keep-annotations`; by default link rectangles move with the translation |
+| Fix link click areas in place | off | `--keep-annotations`; leave off for link areas to follow translated text and line wraps |
 | Fake mode | off | `--fake`, no API call; useful for testing |
 | Extra arguments | empty | Appended to the command; quotes and backslashes work |
 | Config file | empty | Passed as `--config` when set |
@@ -155,8 +155,9 @@ fields.
 
 - Whole-document translation only. Per-paragraph overlays and a local HTTP/SSE
   service are still planned.
-- The bilingual composer does not support pages with a non-zero `/Rotate` yet,
-  and does not copy annotations or links from the original pages.
+- The bilingual composer preserves links on both halves, including external
+  URLs and internal page/reference jumps, with rotated and cropped pages
+  supported. Other annotations (comments, forms, etc.) are not copied.
 - Table cells and the reference list are intentionally kept as original text;
   a protected page therefore appears unchanged on both sides.
 - Zotero's plugin sandbox must be able to execute the binary. Linux package

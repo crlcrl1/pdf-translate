@@ -21,7 +21,7 @@ const PREFS = {
   "extensions.pdf-translate.openWhenDone": true,
 };
 
-function harness({ existingBilingual = false } = {}) {
+function harness({ existingBilingual = false, cached = null, missingImportedFile = false } = {}) {
   const prefs = { ...PREFS };
   const calls = {
     runs: [],
@@ -54,7 +54,7 @@ function harness({ existingBilingual = false } = {}) {
     parentItemID: 2,
     deleted: false,
     isPDFAttachment: () => true,
-    getFilePathAsync: async () => "/tmp/zotero-data/pdf-translate/outputs/OLD.bilingual.pdf",
+    getFilePathAsync: async () => missingImportedFile ? null : "/tmp/zotero-data/pdf-translate/outputs/OLD.bilingual.pdf",
     getField: (field) => (field === "title" ? "Bilingual (zh-CN)" : ""),
     getNote: () => "pdf-translate:SOURCEKEY:zh-CN:clean:bilingual",
   };
@@ -189,7 +189,7 @@ function harness({ existingBilingual = false } = {}) {
       return { lastModified: 1000, size: 1024 };
     },
     async readUTF8() {
-      return "{}";
+      return JSON.stringify(cached || {});
     },
     async writeUTF8(path, text) {
       calls.written = { path, text };
@@ -275,10 +275,23 @@ test("a clean run builds the CLI arguments and imports the output", async () => 
   plugin.shutdown();
 });
 
-test("an existing bilingual attachment is opened without translating", async () => {
-  const { sandbox, calls, attachment } = harness({ existingBilingual: true });
+function validCache() {
+  return {
+    source: "/tmp/paper.pdf", sourceMtime: 1000, sourceSize: 1024,
+    binary: "/usr/bin/pdf-translate", binaryMtime: 1000,
+    pluginVersion: "0.1.0", attachmentID: 5,
+    settings: {
+      configPath: "", targetLang: "zh-CN", pages: "1-", mode: "clean",
+      bilingual: true, translateReferences: false, keepAnnotations: false,
+      fake: false, extraArgs: "",
+    },
+  };
+}
+
+test("an existing bilingual attachment with matching metadata is opened without translating", async () => {
+  const { sandbox, calls, attachment } = harness({ existingBilingual: true, cached: validCache() });
   const plugin = sandbox.PdfTranslate;
-  plugin.init({ id: "pdf-translate@crl.local", version: "0.3.0", rootURI: "file:///plugin/" });
+  plugin.init({ id: "pdf-translate@crl.local", version: "0.1.0", rootURI: "file:///plugin/" });
   await plugin.startup();
 
   await plugin.translateAttachment(attachment);
@@ -286,6 +299,39 @@ test("an existing bilingual attachment is opened without translating", async () 
   assert.equal(calls.runs.length, 0);
   assert.deepEqual(calls.opened, [5]);
   assert.equal(calls.imported.length, 0);
+  plugin.shutdown();
+});
+
+test("old bilingual attachments cannot bypass changed settings, binaries, or missing metadata", async () => {
+  for (const change of ["keepAnnotations", "binary", "metadata"]) {
+    const cached = change === "metadata" ? null : validCache();
+    if (change === "binary") cached.binaryMtime = 500;
+    const { sandbox, calls, attachment } = harness({ existingBilingual: true, cached });
+    const plugin = sandbox.PdfTranslate;
+    plugin.init({ id: "pdf-translate@crl.local", version: "0.1.0", rootURI: "file:///plugin/" });
+    await plugin.startup();
+    if (change === "keepAnnotations") plugin.setPref("keepAnnotations", true);
+    await plugin.translateAttachment(attachment);
+    assert.equal(calls.runs.length, 1, change);
+    assert.equal(calls.imported.length, 1, change);
+    assert.deepEqual(calls.opened, [9], change);
+    assert.equal(calls.alerts.length, 0, change);
+    if (change === "keepAnnotations") assert.ok(calls.runs[0].arguments.includes("--keep-annotations"));
+    plugin.shutdown();
+  }
+});
+
+test("a missing imported PDF is reimported from a matching cache", async () => {
+  const { sandbox, calls, attachment } = harness({ existingBilingual: true, cached: validCache(), missingImportedFile: true });
+  const plugin = sandbox.PdfTranslate;
+  plugin.init({ id: "pdf-translate@crl.local", version: "0.1.0", rootURI: "file:///plugin/" });
+  await plugin.startup();
+  await plugin.translateAttachment(attachment);
+  assert.equal(calls.runs.length, 0);
+  assert.equal(calls.imported.length, 1);
+  assert.deepEqual(calls.opened, [9]);
+  assert.equal(calls.alerts.length, 0);
+  assert.equal(JSON.parse(calls.written.text).attachmentID, 9);
   plugin.shutdown();
 });
 

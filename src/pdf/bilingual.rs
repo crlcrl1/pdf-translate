@@ -1,5 +1,8 @@
 //! Compose a bilingual PDF: each output page contains the original page on the
 //! left and the translated page on the right.
+mod links;
+
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -34,11 +37,14 @@ pub fn write_bilingual_pdf(
     let offset = document.max_id + 1;
     translated.renumber_objects_with(offset);
     let translated_pages = translated.get_pages();
+    let original_destinations = links::named_destinations(&document)?;
+    let translated_destinations = links::named_destinations(&translated)?;
     let translated_max_id = translated.max_id;
     document.objects.extend(translated.objects);
     document.max_id = document.max_id.max(translated_max_id);
 
     let mut new_pages = Vec::with_capacity(original_pages.len());
+    let mut placements = HashMap::new();
     for (page_number, original_id) in &original_pages {
         let translated_id = *translated_pages
             .get(page_number)
@@ -76,7 +82,40 @@ pub fn write_bilingual_pdf(
             "Resources" => resources,
             "Contents" => content_id,
         });
+        for (source_id, x) in [(*original_id, 0.0), (translated_id, width + GUTTER)] {
+            placements.insert(
+                source_id,
+                links::PagePlacement {
+                    page: page_id,
+                    transform: Affine::translate((x, 0.0)) * page_transform(&document, source_id)?,
+                    bounds: Rect::new(x, 0.0, x + width, height),
+                },
+            );
+        }
         new_pages.push(page_id);
+    }
+
+    // Resolve links only once every destination page has its final object ID.
+    // Each source has its own named destinations, even when their names match.
+    for (page_number, original_id) in &original_pages {
+        let translated_id = translated_pages[page_number];
+        let mut annots = links::copy_page_links(
+            &mut document,
+            *original_id,
+            &placements,
+            &original_destinations,
+        )?;
+        annots.extend(links::copy_page_links(
+            &mut document,
+            translated_id,
+            &placements,
+            &translated_destinations,
+        )?);
+        if !annots.is_empty() {
+            document
+                .get_dictionary_mut(placements[original_id].page)?
+                .set("Annots", annots);
+        }
     }
 
     let pages_id = document.add_object(dictionary! {
@@ -266,6 +305,124 @@ mod tests {
     }
 
     #[test]
+    fn copies_links_and_resolves_named_targets_on_each_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.pdf");
+        let translated = dir.path().join("translated.pdf");
+        let output = dir.path().join("bilingual.pdf");
+        for (path, x) in [(&original, 72), (&translated, 90)] {
+            one_page_pdf(path, "Links");
+            let mut doc = Document::load(path).unwrap();
+            let first = doc.get_pages()[&1];
+            let second = doc.add_object(doc.get_dictionary(first).unwrap().clone());
+            let pages = doc
+                .get_dictionary(first)
+                .unwrap()
+                .get(b"Parent")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            doc.get_dictionary_mut(pages)
+                .unwrap()
+                .set("Kids", vec![first.into(), second.into()]);
+            doc.get_dictionary_mut(pages).unwrap().set("Count", 2);
+            let target = vec![
+                second.into(),
+                "XYZ".into(),
+                x.into(),
+                650.into(),
+                Object::Null,
+            ];
+            let leaf = doc.add_object(dictionary! {
+                "Names" => vec![Object::string_literal("reference"), Object::Array(target.clone())],
+            });
+            doc.catalog_mut().unwrap().set(
+                "Names",
+                dictionary! {
+                    "Dests" => dictionary! { "Kids" => vec![Object::Reference(leaf)] },
+                },
+            );
+            doc.catalog_mut().unwrap().set(
+                "Dests",
+                dictionary! {
+                    "legacy" => dictionary! { "D" => target.clone() },
+                },
+            );
+            let uri = doc.add_object(dictionary! {
+                "Subtype" => "Link", "Rect" => vec![x.into(), 700.into(), (x + 40).into(), 712.into()], "P" => first,
+                "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal("https://example.org/paper") },
+            });
+            let goto = doc.add_object(dictionary! {
+                "S" => "GoTo", "D" => Object::string_literal("reference"),
+            });
+            let internal = doc.add_object(dictionary! {
+                "Subtype" => "Link", "Rect" => vec![x.into(), 680.into(), (x + 40).into(), 692.into()], "A" => goto,
+            });
+            let direct = Object::Dictionary(dictionary! {
+                "Subtype" => "Link", "Rect" => vec![x.into(), 660.into(), (x + 40).into(), 672.into()], "Dest" => "legacy",
+            });
+            let annots = doc.add_object(vec![uri.into(), internal.into(), direct]);
+            doc.get_dictionary_mut(first).unwrap().set("Annots", annots);
+            doc.save(path).unwrap();
+        }
+
+        write_bilingual_pdf(&original, &translated, &output).unwrap();
+        let doc = Document::load(output).unwrap();
+        let pages = doc.get_pages();
+        let annots = doc
+            .get_dictionary(pages[&1])
+            .unwrap()
+            .get(b"Annots")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(annots.len(), 6);
+        for (side, links) in annots.as_chunks::<3>().0.iter().enumerate() {
+            let x = if side == 0 {
+                72.0
+            } else {
+                90.0 + 612.0 + GUTTER
+            };
+            for (index, link) in links.iter().enumerate() {
+                let link = doc.dereference(link).unwrap().1.as_dict().unwrap();
+                assert_eq!(link.get(b"P").unwrap().as_reference().unwrap(), pages[&1]);
+                assert_eq!(
+                    link.get(b"Rect").unwrap().as_array().unwrap()[0]
+                        .as_float()
+                        .unwrap(),
+                    x as f32
+                );
+                let target = if index == 2 {
+                    link.get(b"Dest").unwrap()
+                } else {
+                    let action = link.get_deref(b"A", &doc).unwrap().as_dict().unwrap();
+                    if index == 0 {
+                        assert_eq!(
+                            action.get(b"URI").unwrap().as_str().unwrap(),
+                            b"https://example.org/paper"
+                        );
+                        continue;
+                    }
+                    action.get(b"D").unwrap()
+                }
+                .as_array()
+                .unwrap();
+                assert_eq!(target[0].as_reference().unwrap(), pages[&2]);
+                assert_eq!(target[2].as_float().unwrap(), x as f32);
+                assert_eq!(target[3].as_float().unwrap(), 650.0);
+            }
+        }
+        // No link may keep the obsolete source page trees reachable.
+        assert_eq!(
+            doc.objects
+                .values()
+                .filter(|object| object.type_name().ok() == Some(b"Page".as_slice()))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn rotated_cropped_pages_render_upright_on_both_sides() {
         for rotation in [0, 90, 180, 270] {
             let dir = tempfile::tempdir().unwrap();
@@ -287,8 +444,67 @@ mod tests {
                 "CropBox",
                 vec![20.into(), 30.into(), 592.into(), 762.into()],
             );
+            let link = document.add_object(dictionary! {
+                "Subtype" => "Link", "P" => page,
+                "Rect" => vec![72.into(), 700.into(), 112.into(), 712.into()],
+                "QuadPoints" => vec![72.into(), 712.into(), 112.into(), 712.into(), 72.into(), 700.into(), 112.into(), 700.into()],
+                "Border" => vec![0.into(), 0.into(), 0.into()],
+                "Dest" => vec![page.into(), "XYZ".into(), 90.into(), 650.into(), Object::Null],
+            });
+            document
+                .get_dictionary_mut(page)
+                .unwrap()
+                .set("Annots", vec![Object::Reference(link)]);
             document.save(&input).unwrap();
             write_bilingual_pdf(&input, &input, &output).unwrap();
+            let output_doc = Document::load(&output).unwrap();
+            let output_page = output_doc.get_pages()[&1];
+            let output_links = output_doc.get_page_annotations(output_page).unwrap();
+            assert_eq!(output_links.len(), 2);
+            let (expected_rect, expected_point, expected_quad) = match rotation {
+                0 => (
+                    [52., 670., 92., 682.],
+                    [70., 620.],
+                    [52., 682., 92., 682., 52., 670., 92., 670.],
+                ),
+                90 => (
+                    [670., 480., 682., 520.],
+                    [620., 502.],
+                    [682., 520., 682., 480., 670., 520., 670., 480.],
+                ),
+                180 => (
+                    [480., 50., 520., 62.],
+                    [502., 112.],
+                    [520., 50., 480., 50., 520., 62., 480., 62.],
+                ),
+                _ => (
+                    [50., 52., 62., 92.],
+                    [112., 70.],
+                    [50., 52., 50., 92., 62., 52., 62., 92.],
+                ),
+            };
+            for (side, link) in output_links.iter().enumerate() {
+                let offset = side as f64 * (if rotation % 180 == 0 { 572. } else { 732. } + GUTTER);
+                for (key, expected) in [
+                    (b"Rect".as_slice(), expected_rect.as_slice()),
+                    (b"QuadPoints".as_slice(), expected_quad.as_slice()),
+                ] {
+                    let actual = link.get(key).unwrap().as_array().unwrap();
+                    for (index, expected) in expected.iter().enumerate() {
+                        assert_eq!(
+                            f64::from(actual[index].as_float().unwrap()),
+                            expected + if index % 2 == 0 { offset } else { 0. }
+                        );
+                    }
+                }
+                let dest = link.get(b"Dest").unwrap().as_array().unwrap();
+                assert_eq!(dest[0].as_reference().unwrap(), output_page);
+                assert_eq!(
+                    f64::from(dest[2].as_float().unwrap()),
+                    expected_point[0] + offset
+                );
+                assert_eq!(f64::from(dest[3].as_float().unwrap()), expected_point[1]);
+            }
             let render = |path: &Path| {
                 let pdf = hayro::hayro_syntax::Pdf::new(std::fs::read(path).unwrap()).unwrap();
                 hayro::render(

@@ -274,38 +274,6 @@ var PdfTranslate = {
 
   // Translation
 
-  async findExistingBilingual(attachment, settings) {
-    if (!settings.bilingual) {
-      return null;
-    }
-    let marker = `${OUTPUT_NOTE_PREFIX}${attachment.key}:${settings.targetLang}:${settings.mode}:bilingual`;
-    let candidates = [];
-    if (attachment.parentItemID) {
-      let parent = Zotero.Items.get(attachment.parentItemID);
-      candidates = Zotero.Items.get(parent?.getAttachments() || []);
-    }
-    else {
-      let items = await Zotero.Items.getAll(attachment.libraryID);
-      candidates = items.filter((item) => item.isAttachment());
-    }
-    for (let item of candidates) {
-      if (item.deleted || !item.isPDFAttachment?.()) {
-        continue;
-      }
-      let note = "";
-      try {
-        note = item.getNote() || "";
-      }
-      catch {
-        continue;
-      }
-      if (note === marker && await item.getFilePathAsync()) {
-        return item;
-      }
-    }
-    return null;
-  },
-
   async translateAttachment(attachment, options = {}) {
     let key = `${attachment.libraryID}/${attachment.key}`;
     if (this.running.has(key)) {
@@ -327,25 +295,6 @@ var PdfTranslate = {
       let input = await attachment.getFilePathAsync();
       if (!input) {
         throw new UserError(this.t("error-no-file"));
-      }
-
-      // Reuse an existing bilingual attachment before touching the binary or
-      // the model. This is what makes a second click open the old version.
-      if (settings.importAttachment) {
-        let existing = await this.findExistingBilingual(attachment, settings);
-        if (existing) {
-          let path = await existing.getFilePathAsync();
-          let sourceStat = await IOUtils.stat(input);
-          let outputStat = await IOUtils.stat(path);
-          if (outputStat.lastModified >= sourceStat.lastModified) {
-            progress.status(this.t("progress-cached"), 100);
-            if (settings.openWhenDone) {
-              await Zotero.Reader.open(existing.id);
-            }
-            progress.done(this.t("progress-done", { title: existing.getField("title") }));
-            return;
-          }
-        }
       }
 
       progress.status(this.t("progress-binary"), 1);
@@ -391,8 +340,14 @@ var PdfTranslate = {
         }
       }
       if (cached && PdfTranslateUtil.cacheMatches(cached, currentCache)) {
+        // Imported attachments obey the same settings and binary checks as
+        // cached files; their hidden note alone does not establish freshness.
         progress.status(this.t("progress-cached"), 100);
         let result = await this.finish(attachment, output, settings, cached);
+        if (result.attachmentID && result.attachmentID !== cached.attachmentID) {
+          cached.attachmentID = result.attachmentID;
+          await IOUtils.writeUTF8(metadataPath, JSON.stringify(cached, null, 2));
+        }
         progress.done(this.t("progress-done", { title: result.title }));
         return;
       }
@@ -463,7 +418,8 @@ var PdfTranslate = {
       return { title: PathUtils.filename(output) };
     }
     let attachment = cached?.attachmentID ? Zotero.Items.get(cached.attachmentID) : null;
-    if (!attachment || attachment.deleted) {
+    let path = attachment && !attachment.deleted ? await attachment.getFilePathAsync() : null;
+    if (!path || !(await IOUtils.exists(path))) {
       attachment = await this.importOutput(original, output, settings);
     }
     if (settings.openWhenDone) {

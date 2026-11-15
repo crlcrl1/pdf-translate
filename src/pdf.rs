@@ -2067,6 +2067,91 @@ mod regression {
     }
 
     #[test]
+    fn colored_links_follow_their_own_text_across_line_wraps() {
+        let mut fixture = Fixture::new(
+            "BT /F1 14 Tf 72 520 Td (See ) Tj 0 0 0.55 rg (Smith) Tj 0 g ( and ) Tj 0 0 0.55 rg (Smith) Tj 0 g ( for important details.) Tj ET",
+        );
+        let mut layout = fixture.layout();
+        let page = &mut layout.pages[0];
+        let source_spans = page
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.color == [0, 0, 140, 255])
+            .map(|span| span.bbox)
+            .collect::<Vec<_>>();
+        assert_eq!(source_spans.len(), 2);
+        let ids = source_spans
+            .iter()
+            .map(|b| {
+                fixture.add_annotation("Link", [b.x0 - 0.5, b.y0 - 0.5, b.x1 + 0.5, b.y1 + 0.5])
+            })
+            .collect::<Vec<_>>();
+        let paragraph = &mut page.paragraphs[0];
+        assert_eq!(
+            paragraph
+                .prompt_text
+                .as_ref()
+                .unwrap()
+                .matches("<c00008cff>")
+                .count(),
+            2
+        );
+        paragraph.bbox.y0 -= 80.0;
+        paragraph.translation =
+            Some("译译译译译 <c00008cff>译译\n译译</c> plain text <c00008cff>译</c>.".into());
+        let (set, stats) = typeset(&layout, "ttf", 0.72);
+        assert_eq!(stats.overflow, 0);
+        let colored = set
+            .paragraphs
+            .values()
+            .next()
+            .unwrap()
+            .lines
+            .iter()
+            .flat_map(|line| &line.segments)
+            .filter(|segment| segment.color == [0, 0, 140, 255])
+            .map(|segment| {
+                segment
+                    .glyph_boxes
+                    .iter()
+                    .copied()
+                    .reduce(BBox::union)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(colored.len(), 3);
+        let output = fixture.write_layout(&layout, &set, ComposeMode::Clean, "colored-links.pdf");
+        let doc = Document::load(output).unwrap();
+        let quads = doc
+            .get_dictionary(ids[0])
+            .unwrap()
+            .get(b"QuadPoints")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(quads.len(), 16);
+        for (i, bbox) in colored[..2].iter().enumerate() {
+            let actual = &quads[i * 8..(i + 1) * 8];
+            let expected = [
+                bbox.x0, bbox.y1, bbox.x1, bbox.y1, bbox.x0, bbox.y0, bbox.x1, bbox.y0,
+            ];
+            for (a, b) in actual.iter().zip(expected) {
+                assert!((f64::from(a.as_float().unwrap()) - b).abs() < 0.01);
+            }
+        }
+        let second = annotation_rect(&doc, ids[1]);
+        for (a, b) in
+            second
+                .iter()
+                .zip([colored[2].x0, colored[2].y0, colored[2].x1, colored[2].y1])
+        {
+            assert!((a - b).abs() < 0.01);
+        }
+        assert_ne!(annotation_rect(&doc, ids[0])[0], source_spans[0].x0);
+    }
+
+    #[test]
     fn keep_annotations_preserves_original_link_rects() {
         let mut fixture = Fixture::new(BODY);
         let link = fixture.add_annotation("Link", [70.0, 500.0, 520.0, 550.0]);

@@ -1,3 +1,5 @@
+mod link_text;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -250,6 +252,8 @@ fn remap_link_annotations(
 
     let mut kept = Vec::with_capacity(array.len());
     let mut changed = false;
+    let text_map = link_text::TextMap::new(page, translated);
+    let to_layout = page_matrix(page);
     for annot in array {
         if !is_link_annotation(document, &annot) {
             kept.push(annot);
@@ -273,7 +277,16 @@ fn remap_link_annotations(
             kept.push(annot);
             continue;
         };
-        let Some(mapped) = remap_rect(rect, page, translated) else {
+        let precise = text_map.map(transform_rect(rect, to_layout));
+        let regions = if let Some(regions) = precise {
+            regions
+                .into_iter()
+                .map(|region| transform_rect(region, to_layout.inverse()))
+                .collect::<Vec<_>>()
+        } else {
+            remap_rect(rect, page, translated).into_iter().collect()
+        };
+        let Some(mapped) = regions.iter().copied().reduce(BBox::union) else {
             kept.push(annot);
             continue;
         };
@@ -283,19 +296,27 @@ fn remap_link_annotations(
             mapped.x1.into(),
             mapped.y1.into(),
         ]);
-        match id {
-            Some(id) => {
-                let target = document.get_object_mut(id)?.as_dict_mut()?;
-                target.set("Rect", values);
-                target.remove(b"QuadPoints");
-                kept.push(annot);
-            }
-            None => {
-                let mut dict = dict;
-                dict.set("Rect", values);
-                dict.remove(b"QuadPoints");
-                kept.push(Object::Dictionary(dict));
-            }
+        let mut dict = dict;
+        dict.set("Rect", values);
+        if regions.len() > 1 {
+            // Keep separate hit areas across line wraps instead of making
+            // the intervening prose clickable through one large rectangle.
+            dict.set(
+                "QuadPoints",
+                regions
+                    .iter()
+                    .flat_map(|r| [r.x0, r.y1, r.x1, r.y1, r.x0, r.y0, r.x1, r.y0])
+                    .map(Object::from)
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            dict.remove(b"QuadPoints");
+        }
+        if let Some(id) = id {
+            *document.get_dictionary_mut(id)? = dict;
+            kept.push(annot);
+        } else {
+            kept.push(Object::Dictionary(dict));
         }
         changed = true;
     }
@@ -324,6 +345,21 @@ fn remap_rect(
     for (paragraph, typeset) in translated {
         let source = paragraph.bbox;
         if !source.intersects(layout_rect) {
+            continue;
+        }
+        if !page.lines.is_empty()
+            && !paragraph
+                .lines(&page.lines)
+                .flat_map(|line| &line.glyphs)
+                .any(|glyph| {
+                    let x = glyph.bbox.center_x();
+                    let y = (glyph.bbox.y0 + glyph.bbox.y1) * 0.5;
+                    x >= layout_rect.x0
+                        && x <= layout_rect.x1
+                        && y >= layout_rect.y0
+                        && y <= layout_rect.y1
+                })
+        {
             continue;
         }
         let Some(dest) = typeset
@@ -667,6 +703,7 @@ fn write_text_run(
         bold,
         italic,
         color,
+        ..
     } = segment;
     let (bold, italic) = (*bold, *italic);
     let (size, baseline) = (line.size, line.baseline);
