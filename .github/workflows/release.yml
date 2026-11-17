@@ -1,0 +1,229 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  zotero:
+    name: Validate version and package Zotero plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check package, plugin, and release versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          plugin_version = json.loads(Path("zotero/manifest.json").read_text())["version"]
+          if plugin_version != version:
+              raise SystemExit(f"Zotero version {plugin_version} must match Cargo version {version}")
+          tag = os.environ["RELEASE_TAG"]
+          if os.environ["GITHUB_EVENT_NAME"] == "release" and tag != f"v{version}":
+              raise SystemExit(f"Release tag must be v{version}, got {tag!r}")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"version={version}\n")
+          PY
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Check and test Zotero plugin
+        run: |
+          bash -n zotero/build.sh
+          for script in zotero/bootstrap.js zotero/prefs.js zotero/content/*.js; do
+            node --check "$script"
+          done
+          node --test zotero/test/*.test.mjs
+
+      - name: Build XPI and update manifest
+        run: |
+          ./zotero/build.sh
+          node <<'JS'
+          const { createHash } = require("node:crypto");
+          const { readFileSync, writeFileSync } = require("node:fs");
+          const manifest = JSON.parse(readFileSync("zotero/manifest.json", "utf8"));
+          const { id, strict_min_version, strict_max_version } = manifest.applications.zotero;
+          const filename = `pdf-translate-zotero-${manifest.version}.xpi`;
+          const base = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}`;
+          const update = {
+            version: manifest.version,
+            update_link: `${base}/releases/download/v${manifest.version}/${filename}`,
+            update_hash: `sha256:${createHash("sha256").update(readFileSync(`zotero/dist/${filename}`)).digest("hex")}`,
+            applications: { zotero: { strict_min_version, strict_max_version } },
+          };
+          writeFileSync("zotero/dist/update.json", JSON.stringify({
+            addons: { [id]: { updates: [update] } },
+          }, null, 2) + "\n");
+          JS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-zotero
+          path: |
+            zotero/dist/*.xpi
+            zotero/dist/update.json
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  binary:
+    name: Build ${{ matrix.target }}
+    needs: zotero
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extension: ''
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: ''
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extension: ''
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      TARGET: ${{ matrix.target }}
+      BINARY: pdf-translate${{ matrix.extension }}
+      ARCHIVE: pdf-translate-${{ needs.zotero.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake pkg-config libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Install current stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy --target "$TARGET"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Check formatting and default features
+        if: runner.os == 'Linux'
+        run: |
+          cargo +stable fmt --all --check
+          cargo +stable test --locked --target "$TARGET"
+          cargo +stable clippy --locked --all-targets --target "$TARGET" -- -D warnings
+
+      - name: Test GUI build
+        run: cargo +stable test --locked --features gui --target "$TARGET"
+
+      - name: Lint GUI build
+        if: runner.os == 'Linux'
+        run: cargo +stable clippy --locked --all-targets --features gui --target "$TARGET" -- -D warnings
+
+      - name: Build release binary
+        run: cargo +stable build --locked --release --features gui --target "$TARGET"
+
+      - name: Smoke test release binary
+        run: |
+          "target/$TARGET/release/$BINARY" --version
+          "target/$TARGET/release/$BINARY" gui --help
+
+      - name: Stage binary, documentation, and font licenses
+        run: |
+          mkdir -p "package/$ARCHIVE/assets/fonts" "package/$ARCHIVE/docs/images" "package/$ARCHIVE/zotero" dist
+          cp "target/$TARGET/release/$BINARY" "package/$ARCHIVE/"
+          cp README.md README.zh-CN.md LICENSE "package/$ARCHIVE/"
+          cp assets/fonts/LICENSE* assets/fonts/README.md "package/$ARCHIVE/assets/fonts/"
+          cp docs/images/compare-page1.png "package/$ARCHIVE/docs/images/"
+          cp zotero/README.md "package/$ARCHIVE/zotero/"
+
+      - name: Archive Linux and macOS binary
+        if: runner.os != 'Windows'
+        run: tar -czf "dist/$ARCHIVE.tar.gz" -C package "$ARCHIVE"
+
+      - name: Archive Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "package/$env:ARCHIVE" -DestinationPath "dist/$env:ARCHIVE.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  assets:
+    name: Assemble and upload release assets
+    needs: [zotero, binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz *.zip *.xpi update.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload assets to the published release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

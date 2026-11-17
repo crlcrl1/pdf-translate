@@ -14,6 +14,12 @@ single binary directly.
 
 ## Build and install
 
+For a prebuilt version, download `pdf-translate-zotero-<version>.xpi` and the
+binary archive for your OS from [GitHub Releases](https://github.com/crlcrl1/pdf-translate/releases).
+Extract the binary and set its full path in the plugin's **Executable** setting
+(`pdf-translate.exe` on Windows). The XPI does not bundle the executable.
+To build both from source:
+
 ```bash
 # from the repository root
 cargo build --release
@@ -27,6 +33,12 @@ From File…**, and select the XPI.
 The plugin and Rust binary share the package version in `Cargo.toml`. Keep
 `zotero/manifest.json` at that same version when releasing; the build script
 rejects mismatches before writing an XPI, and the manifest test checks it too.
+
+Publishing a GitHub Release tagged `v<version>` runs
+[the release workflow](../.github/workflows/release.yml), which builds the XPI
+and uploads `update.json` with its download URL, SHA-256 hash, and Zotero
+compatibility range. The manifest's update URL follows the latest stable
+GitHub Release. Binary updates must be installed separately.
 
 Put the binary somewhere the plugin can find it:
 

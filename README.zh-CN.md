@@ -51,6 +51,11 @@ PDF ──▶ 提取 ──▶ 版面分析 ──▶ 翻译 ──▶ 排版 �
 
 ## 从源码构建
 
+可从 [GitHub Releases](https://github.com/crlcrl1/pdf-translate/releases) 下载包含 CLI 和 GUI 的
+Linux x86_64、Windows x86_64、macOS（Intel / Apple Silicon）二进制，以及 Zotero `.xpi` 插件。
+二进制保留默认内置字体；解压后运行 `pdf-translate`（Windows 为 `pdf-translate.exe`），
+用 `pdf-translate gui` 打开桌面界面。Linux 版本在 Ubuntu 24.04 上构建，需要 glibc 2.39 或更新版本。
+
 ```bash
 cargo build --release
 # 可执行文件：target/release/pdf-translate
@@ -275,6 +280,25 @@ cargo clippy --all-targets
 cargo test --features gui
 cargo clippy --all-targets --features gui
 ```
+
+### 发布版本
+
+1. 将 `Cargo.toml` 与 `zotero/manifest.json` 设为相同版本，并用 `cargo check` 更新 `Cargo.lock`。
+   将这些修改与[发布工作流](.github/workflows/release.yml) 一起提交、推送。
+2. 在 GitHub 上基于该提交创建 Release，标签使用 `v<版本号>`（如 `v0.1.0`），点击 **Publish release**。
+3. **Release** 工作流通过 `rustup toolchain install stable` 安装当时最新的 Rust 稳定版，执行格式检查、
+   Rust / GUI 与 Zotero 测试，再用 `cargo +stable build --locked --release --features gui` 构建。
+   全部成功后，向 Release 上传四个平台压缩包、`pdf-translate-zotero-<版本号>.xpi`、
+   `update.json` 和 `SHA256SUMS`。
+
+压缩包包含可执行文件、文档与内置字体许可证。XPI 需要单独安装二进制，并按
+[插件文档](zotero/README.md) 在 Zotero 中设置路径。`update.json` 对应插件 manifest 中已有的
+GitHub Releases 更新地址；将稳定版标记为 **Latest** 后，该地址会提供此版本的更新清单。
+插件自动更新不会更新可执行文件。
+
+发布前可在 **Actions → Release → Run workflow** 手动试构建，从运行页面下载产物或汇总的
+`release-assets`；手动运行不会上传到 Release。工作流使用内置的 `GITHUB_TOKEN`，无需额外配置
+Secrets。发布构建失败时，可在 Actions 中重新运行。
 
 模块结构：
 

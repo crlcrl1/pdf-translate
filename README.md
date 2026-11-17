@@ -76,6 +76,13 @@ The default pipeline is:
 
 ## Build from source
 
+Prebuilt CLI + GUI binaries for Linux x86_64, Windows x86_64, and macOS
+(Intel and Apple Silicon), plus the Zotero `.xpi`, are available from
+[GitHub Releases](https://github.com/crlcrl1/pdf-translate/releases).
+The binaries include the default embedded fonts. Extract the archive and run
+`pdf-translate` (`pdf-translate.exe` on Windows); use `pdf-translate gui` to
+open the desktop UI. Linux builds use Ubuntu 24.04 (glibc 2.39 or newer).
+
 ```bash
 cargo build --release
 # binary: target/release/pdf-translate
@@ -331,6 +338,31 @@ cargo clippy --all-targets
 cargo test --features gui
 cargo clippy --all-targets --features gui
 ```
+
+### Publishing a release
+
+1. Set the same version in `Cargo.toml` and `zotero/manifest.json`, and update
+   `Cargo.lock` with `cargo check`. Commit and push these changes together with
+   [the release workflow](.github/workflows/release.yml).
+2. Create a GitHub Release from that commit with the tag `v<version>`
+   (for example, `v0.1.0`), then click **Publish release**.
+3. The **Release** workflow installs the current Rust `stable` toolchain via
+   `rustup toolchain install stable`, checks formatting, runs Rust/GUI and
+   Zotero tests, and builds with `cargo +stable build --locked --release --features gui`.
+   It attaches four binary archives, `pdf-translate-zotero-<version>.xpi`,
+   `update.json`, and `SHA256SUMS` to the release after all builds succeed.
+
+Archives contain the executable, documentation, and licenses for the embedded
+fonts. The XPI uses a separately installed binary; configure its path in Zotero
+as described in [the plugin README](zotero/README.md). `update.json` supplies
+plugin updates through the manifest's existing GitHub Releases URL; mark a
+stable release as **Latest** to serve it there. Plugin updates do not update
+the executable.
+
+To try the build before publishing, select **Actions → Release → Run workflow**.
+Manual runs only produce downloadable workflow artifacts, including the combined
+`release-assets` artifact. The workflow uses the built-in `GITHUB_TOKEN` and
+needs no additional secrets. A failed release run can be re-run from Actions.
 
 Module layout:
 
